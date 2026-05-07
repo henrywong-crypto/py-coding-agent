@@ -226,7 +226,11 @@ def _edit_tool() -> Tool:
 
     return Tool(
         name="edit",
-        description="Replace `old` with `new` in a file. `old` must appear exactly once.",
+        description=(
+            "Replace `old` with `new` in a file. `old` must appear exactly once. "
+            "When deleting a whole line, include its trailing newline in `old` "
+            "(e.g. old='foo\\n', new='') — otherwise a blank line is left behind."
+        ),
         schema={
             "type": "object",
             "properties": {
