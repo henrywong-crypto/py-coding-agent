@@ -719,60 +719,30 @@ def anthropic_cache_hook(api: HookAPI) -> None:
     api.on("before_model_request", mark)
 
 
-def stdout_renderer_hook(api: HookAPI) -> None:
-    md_mode = {"on": False}
-
-    def on_args(event: dict, _ctx: dict) -> None:
-        md_mode["on"] = bool(getattr(event["args"], "markdown", False))
-
-    def on_text_delta(event: dict, _ctx: dict) -> None:
-        if md_mode["on"]:
-            return
-        print(event["text"], end="", flush=True)
-
-    def on_text_end(_event: dict, _ctx: dict) -> None:
-        if md_mode["on"]:
-            return
-        print()
-
+def tool_call_renderer_hook(api: HookAPI) -> None:
     def on_pre_tool_use(event: dict, _ctx: dict) -> None:
         args_repr = ", ".join(f"{k}={v!r}" for k, v in event["input"].items())[:120]
         print(f"\n  → {event['name']}({args_repr})")
 
-    api.on("args_parsed", on_args)
-    api.on("text_delta", on_text_delta)
-    api.on("text_end", on_text_end)
     api.on("pre_tool_use", on_pre_tool_use)
 
 
 def markdown_renderer_hook(api: HookAPI) -> None:
-    """Render each assistant turn as markdown via `rich` when --markdown is set.
-
-    Buffers `text_delta` deltas and prints the formatted block on `text_end`.
-    Suppresses the default streaming text output so you don't get both. Tool
-    call lines from `stdout_renderer_hook` still appear between turns.
-    """
+    """Buffer assistant text and render it as markdown on each turn end."""
     from rich.console import Console
     from rich.markdown import Markdown
 
-    api.register_flag("--markdown", action="store_true")
-    state = {"on": False, "buf": []}
+    buf: list[str] = []
     console = Console()
 
-    def on_args(event: dict, _ctx: dict) -> None:
-        state["on"] = bool(getattr(event["args"], "markdown", False))
-
     def on_delta(event: dict, _ctx: dict) -> None:
-        if state["on"]:
-            state["buf"].append(event["text"])
+        buf.append(event["text"])
 
     def on_end(_event: dict, _ctx: dict) -> None:
-        if state["on"] and state["buf"]:
-            text = "".join(state["buf"])
-            state["buf"].clear()
-            console.print(Markdown(text))
+        if buf:
+            console.print(Markdown("".join(buf)))
+            buf.clear()
 
-    api.on("args_parsed", on_args)
     api.on("text_delta", on_delta)
     api.on("text_end", on_end)
 
@@ -792,7 +762,7 @@ async def main() -> None:
         anthropic_cache_hook,
         cache_stats_hook,
         cache_debug_hook,
-        stdout_renderer_hook,
+        tool_call_renderer_hook,
         markdown_renderer_hook,
         session_start_printer_hook,
         session_end_printer_hook,

@@ -64,8 +64,8 @@ from agent import (
     SessionManager,
     session_end_printer_hook,
     session_start_printer_hook,
-    stdout_renderer_hook,
     system_prompt_hook,
+    tool_call_renderer_hook,
     write_tool_hook,
 )
 
@@ -656,56 +656,19 @@ class TestPrinterHooks:
         assert "session saved to" in capsys.readouterr().err
 
 
-class TestStdoutRendererHook:
-    def _args(self, **kw):
-        from argparse import Namespace
-
-        return Namespace(**{"markdown": False, **kw})
-
-    def test_prints_text_delta(self, capsys):
-        runner = HookRunner()
-        runner.load(stdout_renderer_hook)
-        runner.fire("args_parsed", {"args": self._args()})
-        runner.fire("text_delta", {"text": "hello"})
-        assert "hello" in capsys.readouterr().out
-
+class TestToolCallRendererHook:
     def test_prints_tool_call(self, capsys):
         runner = HookRunner()
-        runner.load(stdout_renderer_hook)
-        runner.fire("args_parsed", {"args": self._args()})
+        runner.load(tool_call_renderer_hook)
         runner.fire("pre_tool_use", {"name": "read", "input": {"path": "/x"}})
         out = capsys.readouterr().out
         assert "read" in out and "/x" in out
 
-    def test_suppresses_text_when_markdown_enabled(self, capsys):
-        """With --markdown set, stdout_renderer defers text to markdown_renderer."""
-        runner = HookRunner()
-        runner.load(stdout_renderer_hook)
-        runner.fire("args_parsed", {"args": self._args(markdown=True)})
-        runner.fire("text_delta", {"text": "hello"})
-        runner.fire("text_end", {})
-        assert capsys.readouterr().out == ""
-
 
 class TestMarkdownRendererHook:
-    def _args(self, **kw):
-        from argparse import Namespace
-
-        return Namespace(**{"markdown": False, **kw})
-
-    def test_disabled_by_default(self, capsys):
+    def test_renders_on_text_end(self, capsys):
         runner = HookRunner()
         runner.load(markdown_renderer_hook)
-        runner.fire("args_parsed", {"args": self._args()})
-        runner.fire("text_delta", {"text": "# hi\n\n**bold**"})
-        runner.fire("text_end", {})
-        # No markdown flag → no output from this hook.
-        assert capsys.readouterr().out == ""
-
-    def test_renders_on_text_end_when_enabled(self, capsys):
-        runner = HookRunner()
-        runner.load(markdown_renderer_hook)
-        runner.fire("args_parsed", {"args": self._args(markdown=True)})
         runner.fire("text_delta", {"text": "# Heading\n\n"})
         runner.fire("text_delta", {"text": "**bold** text"})
         runner.fire("text_end", {})
@@ -720,7 +683,6 @@ class TestMarkdownRendererHook:
     def test_buffer_flushes_between_turns(self, capsys):
         runner = HookRunner()
         runner.load(markdown_renderer_hook)
-        runner.fire("args_parsed", {"args": self._args(markdown=True)})
 
         runner.fire("text_delta", {"text": "first"})
         runner.fire("text_end", {})
@@ -732,13 +694,6 @@ class TestMarkdownRendererHook:
 
         assert "first" in first_out and "second" not in first_out
         assert "second" in second_out and "first" not in second_out
-
-    def test_registers_markdown_flag(self):
-        runner = HookRunner()
-        runner.load(markdown_renderer_hook)
-        # argparse registered the flag without error
-        ns = runner.parser.parse_args(["--markdown"])
-        assert ns.markdown is True
 
 
 # ═══════════════════════════════════════════════════════════════════════════
