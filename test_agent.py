@@ -55,6 +55,7 @@ from agent import (
     cache_stats_hook,
     edit_tool_hook,
     lifecycle_hook,
+    list_sessions_hook,
     markdown_renderer_hook,
     read_tool_hook,
     resume_hook,
@@ -562,6 +563,70 @@ class TestResumeHook:
             },
         )
         assert "path" not in result
+
+
+class TestListSessionsHook:
+    def _args(self, **kw):
+        from argparse import Namespace
+
+        return Namespace(**{"list_sessions": False, **kw})
+
+    def test_disabled_by_default_is_noop(self, capsys):
+        runner = HookRunner()
+        runner.load(list_sessions_hook)
+        runner.fire("args_parsed", {"args": self._args()})
+        assert capsys.readouterr().out == ""
+
+    def test_no_sessions_prints_placeholder(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        runner = HookRunner()
+        runner.load(list_sessions_hook)
+        with pytest.raises(SystemExit) as exc:
+            runner.fire("args_parsed", {"args": self._args(list_sessions=True)})
+        assert exc.value.code == 0
+        assert "no sessions yet" in capsys.readouterr().out
+
+    def test_lists_sessions_newest_first(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        session_dir = tmp_path / ".py-agent" / "sessions"
+        # Create two sessions; the second gets a newer mtime via explicit touch.
+        p1 = session_dir / "20260505T100000_aaaaaaaa.jsonl"
+        sm1 = SessionManager(p1)
+        sm1.append("user", "explain rust lifetimes")
+        p2 = session_dir / "20260506T120000_bbbbbbbb.jsonl"
+        sm2 = SessionManager(p2)
+        sm2.append("user", "write a hello world in rust")
+
+        runner = HookRunner()
+        runner.load(list_sessions_hook)
+        with pytest.raises(SystemExit):
+            runner.fire("args_parsed", {"args": self._args(list_sessions=True)})
+        out = capsys.readouterr().out
+        # Newest (p2) appears first.
+        assert out.index("bbbbbbbb") < out.index("aaaaaaaa")
+        assert "hello world in rust" in out
+        assert "rust lifetimes" in out
+        assert "1 entries" in out
+
+    def test_preview_skips_list_content_messages(self, tmp_path, monkeypatch, capsys):
+        """First user-role entry with string content is the preview; a prior
+        tool_result (list content mapped to user) should be skipped."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        path = tmp_path / ".py-agent" / "sessions" / "20260507T130000_ccccccc1.jsonl"
+        sm = SessionManager(path)
+        sm.append(
+            "tool_result",
+            [{"type": "tool_result", "tool_use_id": "t1", "content": "ignored"}],
+        )
+        sm.append("user", "the real first prompt")
+
+        runner = HookRunner()
+        runner.load(list_sessions_hook)
+        with pytest.raises(SystemExit):
+            runner.fire("args_parsed", {"args": self._args(list_sessions=True)})
+        out = capsys.readouterr().out
+        assert "the real first prompt" in out
+        assert "ignored" not in out
 
 
 class TestPrinterHooks:

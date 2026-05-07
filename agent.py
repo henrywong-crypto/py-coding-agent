@@ -587,6 +587,51 @@ def resume_hook(api: HookAPI) -> None:
     api.on("before_session_load", pick_session)
 
 
+def list_sessions_hook(api: HookAPI) -> None:
+    api.register_flag(
+        "--list-sessions",
+        action="store_true",
+        help="List prior sessions and exit.",
+    )
+
+    def summarize(path: Path) -> tuple[str, int, str]:
+        created, entries, preview = "", 0, ""
+        for line in path.read_text().splitlines():
+            obj = json.loads(line)
+            if obj.get("type") == "header":
+                created = obj.get("createdAt", "")[:16].replace("T", " ")
+            elif obj.get("type") == "entry":
+                entries += 1
+                if not preview and obj.get("role") == "user":
+                    content = obj.get("content")
+                    if isinstance(content, str):
+                        preview = content[:60]
+        return created, entries, preview
+
+    def maybe_list(event: dict, _ctx: dict) -> None:
+        if not event["args"].list_sessions:
+            return
+        session_dir = Path.home() / ".py-agent" / "sessions"
+        files = (
+            sorted(
+                session_dir.glob("*.jsonl"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if session_dir.exists()
+            else []
+        )
+        if not files:
+            print("no sessions yet")
+            sys.exit(0)
+        for path in files:
+            created, entries, preview = summarize(path)
+            print(f"{path.stem}  {created}  {entries} entries  {preview!r}")
+        sys.exit(0)
+
+    api.on("args_parsed", maybe_list)
+
+
 def cache_stats_hook(api: HookAPI) -> None:
     def on_msg(event, _ctx):
         u = event.get("usage") or {}
@@ -738,6 +783,7 @@ async def main() -> None:
         prompt_arg_hook,
         debug_hooks_flag_hook,
         resume_hook,
+        list_sessions_hook,
         system_prompt_hook,
         read_tool_hook,
         write_tool_hook,
