@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["anthropic", "rich", "pytest", "pytest-asyncio", "hypothesis"]
+# dependencies = ["anthropic", "rich", "prompt_toolkit", "pytest", "pytest-asyncio", "hypothesis"]
 # ///
 """
 Tests for agent.py — unit + property-based (fuzz) coverage of the core.
@@ -183,6 +183,21 @@ class TestHookAPI:
         t = _read_tool()
         runner.api.register_tool(t)
         assert runner.tools == [t]
+
+    def test_register_prompter_sets_single(self):
+        runner = HookRunner()
+
+        async def p(args):
+            return "x"
+
+        runner.api.register_prompter(p)
+        assert runner.prompter is p
+
+    def test_register_history_loader_sets_single(self):
+        runner = HookRunner()
+        loader = lambda: ["a", "b"]
+        runner.api.register_history_loader(loader)
+        assert runner.history_loader is loader
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -680,6 +695,77 @@ class TestListSessionsHook:
         ]
         dirs = {_session_dir(p).name for p in paths}
         assert len(dirs) == len(paths)
+
+
+class TestSessionHistoryHook:
+    def test_registers_history_loader(self, tmp_path, monkeypatch):
+        from agent import session_history_hook
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.chdir(tmp_path)
+        runner = HookRunner()
+        runner.load(session_history_hook)
+        assert runner.history_loader is not None
+        assert runner.history_loader() == []  # empty when no sessions
+
+    def test_loads_user_prompts_in_mtime_order(self, tmp_path, monkeypatch):
+        from agent import _session_dir, session_history_hook
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.chdir(tmp_path)
+        d = _session_dir(str(tmp_path))
+        sm1 = SessionManager(d / "s1.jsonl")
+        sm1.append("user", "first")
+        sm1.append("assistant", [{"type": "text", "text": "reply"}])
+        sm2 = SessionManager(d / "s2.jsonl")
+        sm2.append("user", "second")
+
+        runner = HookRunner()
+        runner.load(session_history_hook)
+        assert runner.history_loader() == ["first", "second"]
+
+    def test_skips_non_user_and_non_string_entries(self, tmp_path, monkeypatch):
+        from agent import _session_dir, session_history_hook
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.chdir(tmp_path)
+        sm = SessionManager(_session_dir(str(tmp_path)) / "s.jsonl")
+        sm.append("user", "kept")
+        sm.append("assistant", [{"type": "text", "text": "skipped"}])
+        sm.append(
+            "tool_result",
+            [{"type": "tool_result", "tool_use_id": "x", "content": "skipped"}],
+        )
+
+        runner = HookRunner()
+        runner.load(session_history_hook)
+        assert runner.history_loader() == ["kept"]
+
+
+class TestPromptToolkitHook:
+    def _args(self, prompt):
+        from argparse import Namespace
+
+        return Namespace(prompt=prompt)
+
+    def test_registers_prompter(self):
+        from agent import prompt_toolkit_hook
+
+        runner = HookRunner()
+        runner.load(prompt_toolkit_hook)
+        assert runner.prompter is not None
+
+    def test_cli_prompt_bypasses_prompt_toolkit(self):
+        """When args.prompt is given, the prompter returns joined args without touching stdin."""
+        import asyncio
+        from agent import prompt_toolkit_hook
+
+        runner = HookRunner()
+        runner.load(prompt_toolkit_hook)
+        assert (
+            asyncio.run(runner.prompter(self._args(["hello", "world"])))
+            == "hello world"
+        )
 
 
 class TestPrinterHooks:

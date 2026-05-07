@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["anthropic", "rich"]
+# dependencies = ["anthropic", "rich", "prompt_toolkit"]
 # ///
 """
 Python coding agent.
@@ -83,8 +83,20 @@ class HookAPI:
     def register_tool(self, tool: "Tool") -> None:
         self._runner.tools.append(tool)
 
+    def register_prompter(self, fn: Callable[..., Any]) -> None:
+        """Register the async callable that reads the initial user prompt."""
+        self._runner.prompter = fn
+
+    def register_history_loader(self, fn: Callable[[], list[str]]) -> None:
+        """Register a callable that returns prior prompts for up/down navigation."""
+        self._runner.history_loader = fn
+
     def register_flag(self, *args: Any, **kwargs: Any) -> None:
         self._runner.parser.add_argument(*args, **kwargs)
+
+    @property
+    def runner(self) -> "HookRunner":
+        return self._runner
 
 
 class HookRunner:
@@ -92,6 +104,8 @@ class HookRunner:
         self.events: dict[str, Event] = {}
         self.handlers: dict[str, list[Callable[[dict, dict], Any]]] = {}
         self.tools: list[Tool] = []
+        self.prompter: Callable[..., Any] | None = None
+        self.history_loader: Callable[[], list[str]] | None = None
         self.parser = argparse.ArgumentParser(
             prog="agent.py", description="Single-file Python coding agent."
         )
@@ -596,6 +610,57 @@ def _session_dir(cwd: str) -> Path:
     return Path.home() / ".py-agent" / "sessions" / f"--{safe}-{digest}--"
 
 
+def session_history_hook(api: HookAPI) -> None:
+    """Provide prior user prompts from this cwd's sessions as history entries."""
+
+    def load() -> list[str]:
+        session_dir = _session_dir(os.getcwd())
+        if not session_dir.exists():
+            return []
+        entries: list[str] = []
+        for path in sorted(
+            session_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime
+        ):
+            for line in path.read_text().splitlines():
+                obj = json.loads(line)
+                if (
+                    obj.get("type") == "entry"
+                    and obj.get("role") == "user"
+                    and isinstance(obj.get("content"), str)
+                    and obj["content"].strip()
+                ):
+                    entries.append(obj["content"].strip())
+        return entries
+
+    api.register_history_loader(load)
+
+
+def prompt_toolkit_hook(api: HookAPI) -> None:
+    """Register a prompt_toolkit prompter. Consumes `runner.history_loader` if present."""
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.history import InMemoryHistory
+    from prompt_toolkit.key_binding import KeyBindings
+
+    runner = api.runner
+
+    async def read(args: argparse.Namespace) -> str:
+        if args.prompt:
+            return " ".join(args.prompt)
+        history = InMemoryHistory()
+        if runner.history_loader:
+            for entry in runner.history_loader():
+                history.append_string(entry)
+        kb = KeyBindings()
+        kb.add("c-d")(lambda _: None)  # disable Ctrl-D — only Ctrl-C exits
+        session = PromptSession(history=history, key_bindings=kb)
+        try:
+            return (await session.prompt_async("> ")).strip()
+        except KeyboardInterrupt:
+            return ""
+
+    api.register_prompter(read)
+
+
 def list_sessions_hook(api: HookAPI) -> None:
     api.register_flag(
         "--list-sessions",
@@ -760,6 +825,8 @@ async def main() -> None:
     runner = HookRunner()
     for hook in (
         prompt_arg_hook,
+        session_history_hook,
+        prompt_toolkit_hook,
         debug_hooks_flag_hook,
         resume_hook,
         list_sessions_hook,
@@ -794,9 +861,13 @@ async def main() -> None:
     )
     session_path = override.get("path", default_path)
 
-    if not args.prompt:
-        runner.parser.error("prompt is required")
-    prompt = " ".join(args.prompt)
+    prompt = (
+        await runner.prompter(args)
+        if runner.prompter
+        else " ".join(args.prompt) if args.prompt else ""
+    )
+    if not prompt:
+        return
 
     session = SessionManager(session_path)
 
@@ -815,4 +886,7 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print()
