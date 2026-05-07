@@ -571,6 +571,11 @@ class TestListSessionsHook:
 
         return Namespace(**{"list_sessions": False, **kw})
 
+    def _session_dir(self, tmp_path):
+        from agent import _session_dir
+
+        return _session_dir(str(tmp_path))
+
     def test_disabled_by_default_is_noop(self, capsys):
         runner = HookRunner()
         runner.load(list_sessions_hook)
@@ -579,6 +584,7 @@ class TestListSessionsHook:
 
     def test_no_sessions_prints_placeholder(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.chdir(tmp_path)
         runner = HookRunner()
         runner.load(list_sessions_hook)
         with pytest.raises(SystemExit) as exc:
@@ -588,7 +594,8 @@ class TestListSessionsHook:
 
     def test_lists_sessions_newest_first(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setenv("HOME", str(tmp_path))
-        session_dir = tmp_path / ".py-agent" / "sessions"
+        monkeypatch.chdir(tmp_path)
+        session_dir = self._session_dir(tmp_path)
         # Create two sessions; the second gets a newer mtime via explicit touch.
         p1 = session_dir / "20260505T100000_aaaaaaaa.jsonl"
         sm1 = SessionManager(p1)
@@ -612,7 +619,9 @@ class TestListSessionsHook:
         """First user-role entry with string content is the preview; a prior
         tool_result (list content mapped to user) should be skipped."""
         monkeypatch.setenv("HOME", str(tmp_path))
-        path = tmp_path / ".py-agent" / "sessions" / "20260507T130000_ccccccc1.jsonl"
+        monkeypatch.chdir(tmp_path)
+        session_dir = self._session_dir(tmp_path)
+        path = session_dir / "20260507T130000_ccccccc1.jsonl"
         sm = SessionManager(path)
         sm.append(
             "tool_result",
@@ -627,6 +636,50 @@ class TestListSessionsHook:
         out = capsys.readouterr().out
         assert "the real first prompt" in out
         assert "ignored" not in out
+
+    def test_sessions_are_per_cwd_scoped(self, tmp_path, monkeypatch, capsys):
+        """A session created in cwd A must not appear when listing from cwd B."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        # Session exists under cwd_a
+        cwd_a = tmp_path / "project-a"
+        cwd_a.mkdir()
+        from agent import _session_dir
+
+        sm = SessionManager(_session_dir(str(cwd_a)) / "20260505T100000_aaaaaaaa.jsonl")
+        sm.append("user", "hello from project a")
+
+        # List from cwd_b
+        cwd_b = tmp_path / "project-b"
+        cwd_b.mkdir()
+        monkeypatch.chdir(cwd_b)
+
+        runner = HookRunner()
+        runner.load(list_sessions_hook)
+        with pytest.raises(SystemExit):
+            runner.fire("args_parsed", {"args": self._args(list_sessions=True)})
+        out = capsys.readouterr().out
+        assert "no sessions yet" in out
+        assert "aaaaaaaa" not in out
+
+    def test_session_dir_encodes_spaces(self):
+        """Spaces in cwd should not appear in the directory name."""
+        from agent import _session_dir
+
+        out = _session_dir("/Users/h/My Documents/project").name
+        assert " " not in out
+        assert out.startswith("--Users-h-My-Documents-project-")
+
+    def test_session_dir_avoids_collisions(self):
+        """Paths that differ only in dashes/spaces/slashes must map to distinct dirs."""
+        from agent import _session_dir
+
+        paths = [
+            "/Users/h/my-project",
+            "/Users/h/my project",
+            "/Users/h/my/project",
+        ]
+        dirs = {_session_dir(p).name for p in paths}
+        assert len(dirs) == len(paths)
 
 
 class TestPrinterHooks:

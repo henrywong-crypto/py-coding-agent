@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import uuid
@@ -587,6 +589,13 @@ def resume_hook(api: HookAPI) -> None:
     api.on("before_session_load", pick_session)
 
 
+def _session_dir(cwd: str) -> Path:
+    """Per-cwd session directory. Readable prefix + short hash to avoid collisions."""
+    safe = re.sub(r"[/\\:\s]+", "-", cwd.lstrip("/\\"))
+    digest = hashlib.sha1(cwd.encode()).hexdigest()[:8]
+    return Path.home() / ".py-agent" / "sessions" / f"--{safe}-{digest}--"
+
+
 def list_sessions_hook(api: HookAPI) -> None:
     api.register_flag(
         "--list-sessions",
@@ -611,7 +620,7 @@ def list_sessions_hook(api: HookAPI) -> None:
     def maybe_list(event: dict, _ctx: dict) -> None:
         if not event["args"].list_sessions:
             return
-        session_dir = Path.home() / ".py-agent" / "sessions"
+        session_dir = _session_dir(os.getcwd())
         files = (
             sorted(
                 session_dir.glob("*.jsonl"),
@@ -773,7 +782,7 @@ async def main() -> None:
     ctx = {"args": args, "runner": runner}
     runner.fire("args_parsed", {"args": args}, ctx)
 
-    session_dir = Path.home() / ".py-agent" / "sessions"
+    session_dir = _session_dir(os.getcwd())
     default_path = (
         session_dir
         / f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex[:8]}.jsonl"
