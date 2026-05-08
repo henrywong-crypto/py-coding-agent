@@ -160,6 +160,10 @@ class Tool:
     description: str
     schema: dict
     execute: Callable[[dict], tuple[str, bool]]
+    # Optional co-located display — if None, ui_hook uses its defaults.
+    render_call: Callable[["Tool", dict, Any], None] | None = None
+    render_result: Callable[["Tool", dict, Any, str, bool, Any], None] | None = None
+    capture_pre: Callable[[dict], Any] | None = None
 
     def to_anthropic(self) -> dict:
         return {
@@ -224,6 +228,32 @@ def _edit_tool() -> Tool:
         except Exception as e:
             return f"{type(e).__name__}: {e}", True
 
+    def capture_pre(args: dict) -> str:
+        try:
+            return Path(args["path"]).read_text()
+        except OSError:
+            return ""
+
+    def render_call(_tool: "Tool", args: dict, console: Any) -> None:
+        console.print(f"\n⏺ [bold]Update[/bold]({args.get('path', '')})")
+
+    def render_result(
+        tool: "Tool",
+        args: dict,
+        pre: Any,
+        content: str,
+        is_error: bool,
+        console: Any,
+    ) -> None:
+        if is_error:
+            _default_render_result(tool, args, pre, content, is_error, console)
+            return
+        try:
+            after = Path(args["path"]).read_text()
+        except OSError:
+            return
+        _render_diff(console, pre or "", after)
+
     return Tool(
         name="edit",
         description=(
@@ -241,6 +271,9 @@ def _edit_tool() -> Tool:
             "required": ["path", "old", "new"],
         },
         execute=execute,
+        capture_pre=capture_pre,
+        render_call=render_call,
+        render_result=render_result,
     )
 
 
@@ -410,10 +443,10 @@ async def agent_loop(
             pre = runner.fire("pre_tool_use", {"name": tu.name, "input": tu.input}, ctx)
             pending_reminders.extend(pre.get("additional_context", []))
 
+            effective_input = pre.get("input", tu.input)
             if pre.get("block"):
                 content, is_error = pre.get("reason", "blocked by hook"), True
             else:
-                effective_input = pre.get("input", tu.input)
                 tool = tool_map.get(tu.name)
                 if tool is None:
                     content, is_error = f"unknown tool: {tu.name}", True
@@ -422,7 +455,12 @@ async def agent_loop(
 
             post = runner.fire(
                 "post_tool_use",
-                {"name": tu.name, "content": content, "is_error": is_error},
+                {
+                    "name": tu.name,
+                    "input": effective_input,
+                    "content": content,
+                    "is_error": is_error,
+                },
                 ctx,
             )
             pending_reminders.extend(post.get("additional_context", []))
@@ -534,25 +572,6 @@ Current working directory: {event['cwd']}
         return {"system_prompt": prompt}
 
     api.on("build_system_prompt", build)
-
-
-def session_start_printer_hook(api: HookAPI) -> None:
-    def on_start(_event: dict, ctx: dict) -> None:
-        session = ctx["session"]
-        if session.entries:
-            print(
-                f"(resumed {session.path}, {len(session.entries)} entries)",
-                file=sys.stderr,
-            )
-
-    api.on("session_start", on_start)
-
-
-def session_end_printer_hook(api: HookAPI) -> None:
-    def on_end(_event: dict, ctx: dict) -> None:
-        print(f"\n(session saved to {ctx['session'].path})", file=sys.stderr)
-
-    api.on("session_end", on_end)
 
 
 def prompt_arg_hook(api: HookAPI) -> None:
@@ -710,20 +729,6 @@ def list_sessions_hook(api: HookAPI) -> None:
     api.on("args_parsed", maybe_list)
 
 
-def cache_stats_hook(api: HookAPI) -> None:
-    def on_msg(event, _ctx):
-        u = event.get("usage") or {}
-        read = u.get("cache_read_input_tokens") or 0
-        write = u.get("cache_creation_input_tokens") or 0
-        total = u.get("input_tokens") or 0
-        print(
-            f"[cache] read={read} write={write} input={total}",
-            file=sys.stderr,
-        )
-
-    api.on("message_end", on_msg)
-
-
 def cache_debug_hook(api: HookAPI) -> None:
     """Dump the cache_control breakpoints in the outbound payload.
 
@@ -797,32 +802,121 @@ def anthropic_cache_hook(api: HookAPI) -> None:
     api.on("before_model_request", mark)
 
 
-def tool_call_renderer_hook(api: HookAPI) -> None:
-    def on_pre_tool_use(event: dict, _ctx: dict) -> None:
-        args_repr = ", ".join(f"{k}={v!r}" for k, v in event["input"].items())[:120]
-        print(f"\n  → {event['name']}({args_repr})")
-
-    api.on("pre_tool_use", on_pre_tool_use)
+def _default_render_call(tool: Tool, args: dict, console: Any) -> None:
+    args_repr = ", ".join(f"{k}={v!r}" for k, v in args.items())[:100]
+    console.print(f"\n⏺ [bold]{tool.name.title()}[/bold]({args_repr})")
 
 
-def markdown_renderer_hook(api: HookAPI) -> None:
-    """Buffer assistant text and render it as markdown on each turn end."""
+def _default_render_result(
+    _tool: Tool,
+    _args: dict,
+    _pre: Any,
+    content: str,
+    is_error: bool,
+    console: Any,
+) -> None:
+    snippet = str(content).split("\n", 1)[0][:100] or "ok"
+    color = "red" if is_error else "dim"
+    console.print(f"  [{color}]⎿ {snippet}[/{color}]")
+
+
+def _render_diff(console: Any, before: str, after: str) -> None:
+    import difflib
+
+    b, a = before.splitlines(), after.splitlines()
+    ops = difflib.SequenceMatcher(None, b, a).get_opcodes()
+    added = sum(j2 - j1 for op, _, _, j1, j2 in ops if op != "equal")
+    removed = sum(i2 - i1 for op, i1, i2, _, _ in ops if op != "equal")
+    if not added and not removed:
+        return
+    w = len(str(max(len(b), len(a), 1)))
+    console.print(f"  [dim]⎿[/dim] [green]+{added}[/green] [red]-{removed}[/red]")
+    for idx, (op, i1, i2, j1, j2) in enumerate(ops):
+        if op != "equal":
+            for k, line in enumerate(b[i1:i2]):
+                console.print(f"    [red]{i1 + k + 1:>{w}} - {line}[/red]")
+            for k, line in enumerate(a[j1:j2]):
+                console.print(f"    [green]{j1 + k + 1:>{w}} + {line}[/green]")
+            continue
+        n = i2 - i1
+        lead = 3 if idx > 0 else 0
+        trail = 3 if idx < len(ops) - 1 else 0
+        rng = range(n) if lead + trail >= n else [*range(lead), *range(n - trail, n)]
+        for k in rng:
+            console.print(f"    [dim]{i1 + k + 1:>{w}}[/dim]   {b[i1 + k]}")
+
+
+def ui_hook(api: HookAPI) -> None:
+    """Single display extension — owns all terminal output in one visual style.
+
+    Conventions:
+      ⏺ bold name(args)   — agent actions (tool calls)
+      ⎿ dim tree leaf     — nested results, cache, diff summary
+      markdown             — assistant text (via rich.markdown)
+      dim parenthetical    — session boundaries, ambient info
+    Tools may override via Tool.render_call / render_result / capture_pre.
+    """
     from rich.console import Console
     from rich.markdown import Markdown
 
+    console = Console(highlight=False)
     buf: list[str] = []
-    console = Console()
+    pre_stack: list[Any] = []  # 1:1 with pre/post_tool_use pairs
 
-    def on_delta(event: dict, _ctx: dict) -> None:
+    def find(name: str) -> Tool | None:
+        return next((t for t in api.runner.tools if t.name == name), None)
+
+    def on_text_delta(event: dict, _ctx: dict) -> None:
         buf.append(event["text"])
 
-    def on_end(_event: dict, _ctx: dict) -> None:
+    def on_text_end(_event: dict, _ctx: dict) -> None:
         if buf:
             console.print(Markdown("".join(buf)))
             buf.clear()
 
-    api.on("text_delta", on_delta)
-    api.on("text_end", on_end)
+    def on_pre_tool(event: dict, _ctx: dict) -> None:
+        tool = find(event["name"])
+        if tool is None:
+            return
+        (tool.render_call or _default_render_call)(tool, event["input"], console)
+        pre_stack.append(tool.capture_pre(event["input"]) if tool.capture_pre else None)
+
+    def on_post_tool(event: dict, _ctx: dict) -> None:
+        tool = find(event["name"])
+        if tool is None:
+            return
+        pre = pre_stack.pop() if pre_stack else None
+        (tool.render_result or _default_render_result)(
+            tool,
+            event.get("input", {}),
+            pre,
+            event.get("content", ""),
+            bool(event.get("is_error")),
+            console,
+        )
+
+    def on_message_end(event: dict, _ctx: dict) -> None:
+        u = event.get("usage") or {}
+        r = u.get("cache_read_input_tokens") or 0
+        w = u.get("cache_creation_input_tokens") or 0
+        i = u.get("input_tokens") or 0
+        console.print(f"[dim]  ⎿ cache read={r} write={w} input={i}[/dim]")
+
+    def on_session_start(_event: dict, ctx: dict) -> None:
+        s = ctx["session"]
+        if s.entries:
+            console.print(f"[dim](resumed {s.path}, {len(s.entries)} entries)[/dim]")
+
+    def on_session_end(_event: dict, ctx: dict) -> None:
+        console.print(f"[dim](session saved to {ctx['session'].path})[/dim]")
+
+    api.on("text_delta", on_text_delta)
+    api.on("text_end", on_text_end)
+    api.on("pre_tool_use", on_pre_tool)
+    api.on("post_tool_use", on_post_tool)
+    api.on("message_end", on_message_end)
+    api.on("session_start", on_session_start)
+    api.on("session_end", on_session_end)
 
 
 async def main() -> None:
@@ -840,12 +934,8 @@ async def main() -> None:
         edit_tool_hook,
         bash_tool_hook,
         anthropic_cache_hook,
-        cache_stats_hook,
         cache_debug_hook,
-        tool_call_renderer_hook,
-        markdown_renderer_hook,
-        session_start_printer_hook,
-        session_end_printer_hook,
+        ui_hook,
     ):
         runner.load(hook)
 

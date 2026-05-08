@@ -52,20 +52,16 @@ from agent import (
     # hooks
     anthropic_cache_hook,
     bash_tool_hook,
-    cache_stats_hook,
     edit_tool_hook,
     lifecycle_hook,
     list_sessions_hook,
-    markdown_renderer_hook,
     read_tool_hook,
     resume_hook,
     # session
     SessionEntry,
     SessionManager,
-    session_end_printer_hook,
-    session_start_printer_hook,
     system_prompt_hook,
-    tool_call_renderer_hook,
+    ui_hook,
     write_tool_hook,
 )
 
@@ -768,71 +764,103 @@ class TestPromptToolkitHook:
         )
 
 
-class TestPrinterHooks:
-    def test_session_start_printer_silent_for_new(self, tmp_path, capsys):
-        sm = SessionManager(tmp_path / "s.jsonl")
-        runner = HookRunner()
-        runner.load(session_start_printer_hook)
-        runner.fire("session_start", {"cwd": "/"}, {"session": sm})
-        assert "resumed" not in capsys.readouterr().err
+class TestUIHook:
+    """Single display extension — owns all terminal output."""
 
-    def test_session_start_printer_loud_for_resumed(self, tmp_path, capsys):
-        path = tmp_path / "s.jsonl"
-        sm1 = SessionManager(path)
-        sm1.append("user", "hi")
-        sm2 = SessionManager(path)  # reload — entries present
-        runner = HookRunner()
-        runner.load(session_start_printer_hook)
-        runner.fire("session_start", {"cwd": "/"}, {"session": sm2})
-        err = capsys.readouterr().err
-        assert "resumed" in err and "1 entries" in err
+    def _register_tools(self, runner):
+        from agent import read_tool_hook, edit_tool_hook
 
-    def test_session_end_printer(self, tmp_path, capsys):
-        sm = SessionManager(tmp_path / "s.jsonl")
-        runner = HookRunner()
-        runner.load(session_end_printer_hook)
-        runner.fire("session_end", {}, {"session": sm})
-        assert "session saved to" in capsys.readouterr().err
+        runner.load(read_tool_hook)
+        runner.load(edit_tool_hook)
 
-
-class TestToolCallRendererHook:
-    def test_prints_tool_call(self, capsys):
+    def test_renders_tool_call_with_default(self, capsys):
         runner = HookRunner()
-        runner.load(tool_call_renderer_hook)
+        self._register_tools(runner)
+        runner.load(ui_hook)
         runner.fire("pre_tool_use", {"name": "read", "input": {"path": "/x"}})
+        runner.fire(
+            "post_tool_use",
+            {
+                "name": "read",
+                "input": {"path": "/x"},
+                "content": "hello",
+                "is_error": False,
+            },
+        )
         out = capsys.readouterr().out
-        assert "read" in out and "/x" in out
+        assert "Read" in out and "/x" in out
+        assert "⏺" in out and "⎿" in out
 
-
-class TestMarkdownRendererHook:
-    def test_renders_on_text_end(self, capsys):
+    def test_renders_markdown_on_text_end(self, capsys):
         runner = HookRunner()
-        runner.load(markdown_renderer_hook)
-        runner.fire("text_delta", {"text": "# Heading\n\n"})
-        runner.fire("text_delta", {"text": "**bold** text"})
+        runner.load(ui_hook)
+        runner.fire("text_delta", {"text": "# H\n\n**bold** text"})
         runner.fire("text_end", {})
         out = capsys.readouterr().out
-        # rich strips the raw markdown syntax and prints styled plain text;
-        # the visible words survive.
-        assert "Heading" in out
-        assert "bold" in out
-        # the literal "**" markers should be gone after rendering
-        assert "**" not in out
+        assert "H" in out and "bold" in out
+        assert "**" not in out  # markdown rendered, not raw
 
-    def test_buffer_flushes_between_turns(self, capsys):
+    def test_session_resumed_dim_notice(self, tmp_path, capsys):
+        path = tmp_path / "s.jsonl"
+        SessionManager(path).append("user", "hi")
+        sm = SessionManager(path)  # reload
         runner = HookRunner()
-        runner.load(markdown_renderer_hook)
+        runner.load(ui_hook)
+        runner.fire("session_start", {"cwd": "/"}, {"session": sm})
+        assert "resumed" in capsys.readouterr().out
 
-        runner.fire("text_delta", {"text": "first"})
-        runner.fire("text_end", {})
-        first_out = capsys.readouterr().out
+    def test_session_start_silent_for_new(self, tmp_path, capsys):
+        sm = SessionManager(tmp_path / "s.jsonl")
+        runner = HookRunner()
+        runner.load(ui_hook)
+        runner.fire("session_start", {"cwd": "/"}, {"session": sm})
+        assert "resumed" not in capsys.readouterr().out
 
-        runner.fire("text_delta", {"text": "second"})
-        runner.fire("text_end", {})
-        second_out = capsys.readouterr().out
+    def test_session_end_announces_save(self, tmp_path, capsys):
+        sm = SessionManager(tmp_path / "s.jsonl")
+        runner = HookRunner()
+        runner.load(ui_hook)
+        runner.fire("session_end", {}, {"session": sm})
+        assert "session saved to" in capsys.readouterr().out
 
-        assert "first" in first_out and "second" not in first_out
-        assert "second" in second_out and "first" not in second_out
+    def test_cache_stats_on_message_end(self, capsys):
+        runner = HookRunner()
+        runner.load(ui_hook)
+        runner.fire(
+            "message_end",
+            {
+                "message": [],
+                "usage": {
+                    "input_tokens": 10,
+                    "cache_read_input_tokens": 2048,
+                    "cache_creation_input_tokens": 512,
+                },
+            },
+        )
+        out = capsys.readouterr().out
+        assert "read=2048" in out and "write=512" in out and "input=10" in out
+
+    def test_edit_render_shows_diff(self, tmp_path, capsys):
+        runner = HookRunner()
+        self._register_tools(runner)
+        runner.load(ui_hook)
+        f = tmp_path / "f.txt"
+        f.write_text("a\nold\nc\n")
+        runner.fire("pre_tool_use", {"name": "edit", "input": {"path": str(f)}})
+        f.write_text("a\nnew\nc\n")
+        runner.fire(
+            "post_tool_use",
+            {
+                "name": "edit",
+                "input": {"path": str(f)},
+                "content": "edited",
+                "is_error": False,
+            },
+        )
+        out = capsys.readouterr().out
+        assert "Update" in out
+        assert "old" in out and "new" in out
+        assert "+1" in out and "-1" in out
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1446,50 +1474,6 @@ class TestCacheBreakpointSizing:
             "If this starts failing, the system+tools marker may actually "
             "begin caching and this test should be inverted."
         )
-
-    def test_prints_zeros_when_usage_missing(self, capsys):
-        runner = HookRunner()
-        runner.load(cache_stats_hook)
-        runner.fire("message_end", {"message": [], "usage": {}})
-        err = capsys.readouterr().err
-        assert "[cache] read=0 write=0 input=0" in err
-
-    def test_coerces_none_to_zero(self, capsys):
-        """Anthropic returns None (not missing) when there's no cache activity —
-        cache_stats must render None as 0, not as the literal string 'None'."""
-        runner = HookRunner()
-        runner.load(cache_stats_hook)
-        runner.fire(
-            "message_end",
-            {
-                "message": [],
-                "usage": {
-                    "input_tokens": 100,
-                    "cache_read_input_tokens": None,
-                    "cache_creation_input_tokens": None,
-                },
-            },
-        )
-        err = capsys.readouterr().err
-        assert "read=0 write=0 input=100" in err
-        assert "None" not in err
-
-    def test_reports_real_numbers(self, capsys):
-        runner = HookRunner()
-        runner.load(cache_stats_hook)
-        runner.fire(
-            "message_end",
-            {
-                "message": [],
-                "usage": {
-                    "input_tokens": 10,
-                    "cache_read_input_tokens": 2048,
-                    "cache_creation_input_tokens": 512,
-                },
-            },
-        )
-        err = capsys.readouterr().err
-        assert "read=2048 write=512 input=10" in err
 
 
 # ═══════════════════════════════════════════════════════════════════════════
