@@ -30,12 +30,14 @@ from pathlib import Path
 from typing import Any, Callable
 
 from anthropic import AsyncAnthropic
+from rich.markup import escape
 
 
 class Merge(Enum):
     REPLACE = "replace"
     ACCUMULATE = "accumulate"
     BLOCK = "block"
+    CHAIN = "chain"
 
 
 @dataclass(frozen=True)
@@ -46,15 +48,18 @@ class Return:
 
 BLOCK = Return("block", kind=Merge.BLOCK)
 REASON = Return("reason")
-INPUT = Return("input")
-CONTENT = Return("content")
+INPUT = Return("input", kind=Merge.CHAIN)
+CONTENT = Return("content", kind=Merge.CHAIN)
 IS_ERROR = Return("is_error")
 SYSTEM_PROMPT = Return("system_prompt")
 PATH = Return("path")
 ADDITIONAL_CONTEXT = Return("additional_context", kind=Merge.ACCUMULATE)
-SYSTEM = Return("system")
-TOOLS = Return("tools")
-MESSAGES = Return("messages")
+SYSTEM = Return("system", kind=Merge.CHAIN)
+TOOLS = Return("tools", kind=Merge.CHAIN)
+MESSAGES = Return("messages", kind=Merge.CHAIN)
+MODEL = Return("model")
+MAX_TURNS = Return("max_turns")
+CLIENT = Return("client")
 
 
 @dataclass(frozen=True)
@@ -81,6 +86,8 @@ class HookAPI:
         self._runner.handlers[event].append(handler)
 
     def register_tool(self, tool: "Tool") -> None:
+        if any(t.name == tool.name for t in self._runner.tools):
+            raise ValueError(f"tool {tool.name!r} already registered")
         self._runner.tools.append(tool)
 
     def register_prompter(self, fn: Callable[..., Any]) -> None:
@@ -109,6 +116,7 @@ class HookRunner:
         self.parser = argparse.ArgumentParser(
             prog="agent.py", description="Single-file Python coding agent."
         )
+        self.strict: bool = False
         self.api = HookAPI(self)
         self.load(lifecycle_hook)
 
@@ -124,10 +132,16 @@ class HookRunner:
     def fire(self, event: str, payload: dict, ctx: dict | None = None) -> dict:
         result: dict = {}
         ctx = ctx or {}
+        payload = {**payload}  # handlers see chained values; don't mutate caller's dict
         for handler in self.handlers[event]:
+            for ret in self.events[event].returns:
+                if ret.kind is Merge.CHAIN and ret.key in result:
+                    payload[ret.key] = result[ret.key]
             try:
                 r = handler(payload, ctx) or {}
             except Exception as e:
+                if self.strict:
+                    raise
                 print(f"[hook error on {event}] {e}", file=sys.stderr)
                 continue
             if not isinstance(r, dict) or not r:
@@ -160,10 +174,10 @@ class Tool:
     description: str
     schema: dict
     execute: Callable[[dict], tuple[str, bool]]
-    # Optional co-located display — if None, ui_hook uses its defaults.
-    render_call: Callable[["Tool", dict, Any], None] | None = None
-    render_result: Callable[["Tool", dict, Any, str, bool, Any], None] | None = None
-    capture_pre: Callable[[dict], Any] | None = None
+    # Optional co-located display. Both receive a per-call `state` dict
+    # that carries data from call → result and is visible to other hooks.
+    render_call: Callable[["Tool", dict, Any, dict], None] | None = None
+    render_result: Callable[["Tool", dict, str, bool, Any, dict], None] | None = None
 
     def to_anthropic(self) -> dict:
         return {
@@ -228,31 +242,29 @@ def _edit_tool() -> Tool:
         except Exception as e:
             return f"{type(e).__name__}: {e}", True
 
-    def capture_pre(args: dict) -> str:
-        try:
-            return Path(args["path"]).read_text()
-        except OSError:
-            return ""
-
-    def render_call(_tool: "Tool", args: dict, console: Any) -> None:
+    def render_call(_tool: "Tool", args: dict, console: Any, state: dict) -> None:
         console.print(f"\n⏺ [bold]Update[/bold]({args.get('path', '')})")
+        try:
+            state["pre"] = Path(args["path"]).read_text()
+        except OSError:
+            pass
 
     def render_result(
         tool: "Tool",
         args: dict,
-        pre: Any,
         content: str,
         is_error: bool,
         console: Any,
+        state: dict,
     ) -> None:
         if is_error:
-            _default_render_result(tool, args, pre, content, is_error, console)
+            _default_render_result(tool, args, content, is_error, console, state)
             return
         try:
             after = Path(args["path"]).read_text()
         except OSError:
             return
-        _render_diff(console, pre or "", after)
+        _render_diff(console, state.get("pre", ""), after)
 
     return Tool(
         name="edit",
@@ -271,7 +283,6 @@ def _edit_tool() -> Tool:
             "required": ["path", "old", "new"],
         },
         execute=execute,
-        capture_pre=capture_pre,
         render_call=render_call,
         render_result=render_result,
     )
@@ -440,7 +451,17 @@ async def agent_loop(
 
         tool_results = []
         for tu in tool_uses:
-            pre = runner.fire("pre_tool_use", {"name": tu.name, "input": tu.input}, ctx)
+            tool_state: dict = {}
+            pre = runner.fire(
+                "pre_tool_use",
+                {
+                    "id": tu.id,
+                    "name": tu.name,
+                    "input": tu.input,
+                    "state": tool_state,
+                },
+                ctx,
+            )
             pending_reminders.extend(pre.get("additional_context", []))
 
             effective_input = pre.get("input", tu.input)
@@ -456,10 +477,12 @@ async def agent_loop(
             post = runner.fire(
                 "post_tool_use",
                 {
+                    "id": tu.id,
                     "name": tu.name,
                     "input": effective_input,
                     "content": content,
                     "is_error": is_error,
+                    "state": tool_state,
                 },
                 ctx,
             )
@@ -487,6 +510,7 @@ class AgentSession:
     session: SessionManager
     runner: HookRunner = field(default_factory=HookRunner)
     pending_reminders: list[str] = field(default_factory=list)
+    max_turns: int = 25
 
     def start(self) -> None:
         ctx = {"cwd": os.getcwd(), "session": self.session}
@@ -519,12 +543,14 @@ class AgentSession:
             self.session,
             self.runner,
             self.pending_reminders,
+            self.max_turns,
         )
 
 
 def lifecycle_hook(api: HookAPI) -> None:
     api.register_event("before_session_load", PATH)
     api.register_event("args_parsed")
+    api.register_event("build_session_config", MODEL, MAX_TURNS, CLIENT)
     api.register_event("session_start", ADDITIONAL_CONTEXT)
     api.register_event("user_prompt_submit", BLOCK, REASON, ADDITIONAL_CONTEXT)
     api.register_event("turn_start")
@@ -557,6 +583,9 @@ def bash_tool_hook(api: HookAPI) -> None:
 
 
 def system_prompt_hook(api: HookAPI) -> None:
+    # Closed over at load so the cached prefix stays stable across midnight.
+    today = date.today().isoformat()
+
     def build(event: dict, _ctx: dict) -> dict:
         prompt = f"""You are a Python coding assistant. You have four tools: read, write, edit, bash.
 
@@ -566,7 +595,7 @@ Rules:
 - If a tool errors, read the error and try again.
 - Keep replies short. Explain what you did, not what you're about to do.
 
-Current date: {date.today().isoformat()}
+Current date: {today}
 Current working directory: {event['cwd']}
 """
         return {"system_prompt": prompt}
@@ -592,6 +621,49 @@ def debug_hooks_flag_hook(api: HookAPI) -> None:
     api.on("args_parsed", maybe_print)
 
 
+def model_flag_hook(api: HookAPI) -> None:
+    api.register_flag("--model", default="claude-sonnet-4-6")
+
+    def provide(event: dict, _ctx: dict) -> dict:
+        return {"model": event["args"].model}
+
+    api.on("build_session_config", provide)
+
+
+def max_turns_flag_hook(api: HookAPI) -> None:
+    api.register_flag("--max-turns", type=int, default=25)
+
+    def provide(event: dict, _ctx: dict) -> dict:
+        return {"max_turns": event["args"].max_turns}
+
+    api.on("build_session_config", provide)
+
+
+def strict_hooks_flag_hook(api: HookAPI) -> None:
+    api.register_flag(
+        "--strict-hooks",
+        action="store_true",
+        help="Re-raise exceptions from hook handlers instead of logging them.",
+    )
+
+    def apply(event: dict, _ctx: dict) -> None:
+        api.runner.strict = bool(event["args"].strict_hooks)
+
+    api.on("args_parsed", apply)
+
+
+def session_path_hook(api: HookAPI) -> None:
+    def default(_event: dict, _ctx: dict) -> dict:
+        session_dir = _session_dir(os.getcwd())
+        path = (
+            session_dir
+            / f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex[:8]}.jsonl"
+        )
+        return {"path": path}
+
+    api.on("before_session_load", default)
+
+
 def resume_hook(api: HookAPI) -> None:
     api.register_flag(
         "--new",
@@ -615,7 +687,7 @@ def resume_hook(api: HookAPI) -> None:
             return {"path": path}
         if args.new:
             return None
-        parent = event["default_path"].parent
+        parent = _session_dir(os.getcwd())
         if not parent.exists():
             return None
         files = sorted(parent.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
@@ -774,6 +846,13 @@ def cache_debug_hook(api: HookAPI) -> None:
     api.on("model_request_prepared", dump)
 
 
+def anthropic_client_hook(api: HookAPI) -> None:
+    def provide(_event: dict, _ctx: dict) -> dict:
+        return {"client": AsyncAnthropic()}
+
+    api.on("build_session_config", provide)
+
+
 def anthropic_cache_hook(api: HookAPI) -> None:
     cc = {"type": "ephemeral"}
 
@@ -802,22 +881,22 @@ def anthropic_cache_hook(api: HookAPI) -> None:
     api.on("before_model_request", mark)
 
 
-def _default_render_call(tool: Tool, args: dict, console: Any) -> None:
+def _default_render_call(tool: Tool, args: dict, console: Any, _state: dict) -> None:
     args_repr = ", ".join(f"{k}={v!r}" for k, v in args.items())[:100]
-    console.print(f"\n⏺ [bold]{tool.name.title()}[/bold]({args_repr})")
+    console.print(f"\n⏺ [bold]{tool.name.title()}[/bold]({escape(args_repr)})")
 
 
 def _default_render_result(
     _tool: Tool,
     _args: dict,
-    _pre: Any,
     content: str,
     is_error: bool,
     console: Any,
+    _state: dict,
 ) -> None:
     snippet = str(content).split("\n", 1)[0][:100] or "ok"
     color = "red" if is_error else "dim"
-    console.print(f"  [{color}]⎿ {snippet}[/{color}]")
+    console.print(f"  [{color}]⎿ {escape(snippet)}[/{color}]")
 
 
 def _render_diff(console: Any, before: str, after: str) -> None:
@@ -834,16 +913,16 @@ def _render_diff(console: Any, before: str, after: str) -> None:
     for idx, (op, i1, i2, j1, j2) in enumerate(ops):
         if op != "equal":
             for k, line in enumerate(b[i1:i2]):
-                console.print(f"    [red]{i1 + k + 1:>{w}} - {line}[/red]")
+                console.print(f"    [red]{i1 + k + 1:>{w}} - {escape(line)}[/red]")
             for k, line in enumerate(a[j1:j2]):
-                console.print(f"    [green]{j1 + k + 1:>{w}} + {line}[/green]")
+                console.print(f"    [green]{j1 + k + 1:>{w}} + {escape(line)}[/green]")
             continue
         n = i2 - i1
         lead = 3 if idx > 0 else 0
         trail = 3 if idx < len(ops) - 1 else 0
         rng = range(n) if lead + trail >= n else [*range(lead), *range(n - trail, n)]
         for k in rng:
-            console.print(f"    [dim]{i1 + k + 1:>{w}}[/dim]   {b[i1 + k]}")
+            console.print(f"    [dim]{i1 + k + 1:>{w}}[/dim]   {escape(b[i1 + k])}")
 
 
 def ui_hook(api: HookAPI) -> None:
@@ -861,7 +940,6 @@ def ui_hook(api: HookAPI) -> None:
 
     console = Console(highlight=False)
     buf: list[str] = []
-    pre_stack: list[Any] = []  # 1:1 with pre/post_tool_use pairs
 
     def find(name: str) -> Tool | None:
         return next((t for t in api.runner.tools if t.name == name), None)
@@ -878,21 +956,21 @@ def ui_hook(api: HookAPI) -> None:
         tool = find(event["name"])
         if tool is None:
             return
-        (tool.render_call or _default_render_call)(tool, event["input"], console)
-        pre_stack.append(tool.capture_pre(event["input"]) if tool.capture_pre else None)
+        state = event.get("state", {})
+        (tool.render_call or _default_render_call)(tool, event["input"], console, state)
 
     def on_post_tool(event: dict, _ctx: dict) -> None:
         tool = find(event["name"])
         if tool is None:
             return
-        pre = pre_stack.pop() if pre_stack else None
+        state = event.get("state", {})
         (tool.render_result or _default_render_result)(
             tool,
             event.get("input", {}),
-            pre,
             event.get("content", ""),
             bool(event.get("is_error")),
             console,
+            state,
         )
 
     def on_message_end(event: dict, _ctx: dict) -> None:
@@ -919,58 +997,47 @@ def ui_hook(api: HookAPI) -> None:
     api.on("session_end", on_session_end)
 
 
+HOOKS = (
+    prompt_arg_hook,
+    model_flag_hook,
+    max_turns_flag_hook,
+    strict_hooks_flag_hook,
+    session_history_hook,
+    prompt_toolkit_hook,
+    debug_hooks_flag_hook,
+    session_path_hook,
+    resume_hook,
+    list_sessions_hook,
+    system_prompt_hook,
+    read_tool_hook,
+    write_tool_hook,
+    edit_tool_hook,
+    bash_tool_hook,
+    anthropic_client_hook,
+    anthropic_cache_hook,
+    cache_debug_hook,
+    ui_hook,
+)
+
+
 async def main() -> None:
     runner = HookRunner()
-    for hook in (
-        prompt_arg_hook,
-        session_history_hook,
-        prompt_toolkit_hook,
-        debug_hooks_flag_hook,
-        resume_hook,
-        list_sessions_hook,
-        system_prompt_hook,
-        read_tool_hook,
-        write_tool_hook,
-        edit_tool_hook,
-        bash_tool_hook,
-        anthropic_cache_hook,
-        cache_debug_hook,
-        ui_hook,
-    ):
+    for hook in HOOKS:
         runner.load(hook)
 
     args = runner.parse_args()
     ctx = {"args": args, "runner": runner}
     runner.fire("args_parsed", {"args": args}, ctx)
 
-    session_dir = _session_dir(os.getcwd())
-    default_path = (
-        session_dir
-        / f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex[:8]}.jsonl"
-    )
-    override = runner.fire(
-        "before_session_load",
-        {"args": args, "default_path": default_path},
-        ctx,
-    )
-    session_path = override.get("path", default_path)
+    config = runner.fire("build_session_config", {"args": args}, ctx)
+    session_path = runner.fire("before_session_load", {"args": args}, ctx)["path"]
 
-    prompt = (
-        await runner.prompter(args)
-        if runner.prompter
-        else " ".join(args.prompt) if args.prompt else ""
-    )
+    prompt = await runner.prompter(args)
     if not prompt:
         return
 
     session = SessionManager(session_path)
-
-    agent = AgentSession(
-        client=AsyncAnthropic(),
-        model="claude-sonnet-4-6",
-        session=session,
-        runner=runner,
-    )
+    agent = AgentSession(session=session, runner=runner, **config)
 
     agent.start()
     try:

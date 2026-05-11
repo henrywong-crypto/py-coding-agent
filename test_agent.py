@@ -51,12 +51,17 @@ from agent import (
     _write_tool,
     # hooks
     anthropic_cache_hook,
+    anthropic_client_hook,
     bash_tool_hook,
     edit_tool_hook,
     lifecycle_hook,
     list_sessions_hook,
+    max_turns_flag_hook,
+    model_flag_hook,
     read_tool_hook,
     resume_hook,
+    session_path_hook,
+    strict_hooks_flag_hook,
     # session
     SessionEntry,
     SessionManager,
@@ -72,7 +77,7 @@ from agent import (
 
 class TestMerge:
     def test_enum_members(self):
-        assert {k.name for k in Merge} == {"REPLACE", "ACCUMULATE", "BLOCK"}
+        assert {k.name for k in Merge} == {"REPLACE", "ACCUMULATE", "BLOCK", "CHAIN"}
 
     def test_identity_comparison(self):
         assert Merge.BLOCK is Merge.BLOCK
@@ -118,6 +123,7 @@ class TestRunnerInit:
         expected = {
             "before_session_load",
             "args_parsed",
+            "build_session_config",
             "session_start",
             "user_prompt_submit",
             "turn_start",
@@ -179,6 +185,33 @@ class TestHookAPI:
         t = _read_tool()
         runner.api.register_tool(t)
         assert runner.tools == [t]
+
+    def test_register_tool_rejects_duplicate_name(self):
+        runner = HookRunner()
+        runner.api.register_tool(_read_tool())
+        with pytest.raises(ValueError, match="already registered"):
+            runner.api.register_tool(_read_tool())
+
+    def test_register_tool_error_message_includes_name(self):
+        runner = HookRunner()
+        runner.api.register_tool(_bash_tool())
+        with pytest.raises(ValueError, match="'bash'"):
+            runner.api.register_tool(_bash_tool())
+
+    def test_register_tool_duplicate_does_not_partially_register(self):
+        """Collision must raise *before* mutating the list — no half-registered entry."""
+        runner = HookRunner()
+        runner.api.register_tool(_read_tool())
+        with pytest.raises(ValueError):
+            runner.api.register_tool(_read_tool())
+        assert len(runner.tools) == 1
+        assert runner.tools[0].name == "read"
+
+    def test_register_tool_distinct_names_coexist(self):
+        runner = HookRunner()
+        for t in (_read_tool(), _write_tool(), _edit_tool(), _bash_tool()):
+            runner.api.register_tool(t)
+        assert [t.name for t in runner.tools] == ["read", "write", "edit", "bash"]
 
     def test_register_prompter_sets_single(self):
         runner = HookRunner()
@@ -308,6 +341,194 @@ class TestDescribe:
         runner.api.on("text_delta", lambda e, c: None)
         runner.api.on("text_delta", lambda e, c: None)
         assert "2 handler(s)" in runner.describe()
+
+
+class TestStrictMode:
+    """HookRunner.strict — opt-in flag that turns swallowed handler exceptions
+    into real errors. Useful for debugging hooks during development."""
+
+    def test_default_is_non_strict(self):
+        assert HookRunner().strict is False
+
+    def test_non_strict_swallows_and_continues(self, capsys):
+        runner = HookRunner()
+        second_ran = []
+        runner.api.on("text_delta", lambda e, c: 1 / 0)
+        runner.api.on("text_delta", lambda e, c: second_ran.append(True))
+        runner.fire("text_delta", {"text": "x"})  # must not raise
+        assert second_ran == [True]  # later handler still ran
+        assert "error" in capsys.readouterr().err.lower()
+
+    def test_strict_reraises(self):
+        runner = HookRunner()
+        runner.strict = True
+        runner.api.on("text_delta", lambda e, c: 1 / 0)
+        with pytest.raises(ZeroDivisionError):
+            runner.fire("text_delta", {"text": "x"})
+
+    def test_strict_preserves_exception_type_and_message(self):
+        class Boom(Exception):
+            pass
+
+        runner = HookRunner()
+        runner.strict = True
+
+        def raiser(e, c):
+            raise Boom("specific message")
+
+        runner.api.on("text_delta", raiser)
+        with pytest.raises(Boom, match="specific message"):
+            runner.fire("text_delta", {"text": "x"})
+
+    def test_strict_preserves_traceback(self):
+        """`raise` without args re-raises the current exception with its traceback
+        intact — so users can see which handler failed and where."""
+        import traceback
+
+        runner = HookRunner()
+        runner.strict = True
+
+        def raiser(e, c):
+            raise RuntimeError("inside-handler")
+
+        runner.api.on("text_delta", raiser)
+        try:
+            runner.fire("text_delta", {"text": "x"})
+        except RuntimeError:
+            tb = traceback.format_exc()
+            assert "raiser" in tb  # handler frame appears in traceback
+            assert "inside-handler" in tb
+
+    def test_strict_stops_at_first_raise(self):
+        runner = HookRunner()
+        runner.strict = True
+        calls = []
+        runner.api.on("text_delta", lambda e, c: calls.append(1))
+        runner.api.on("text_delta", lambda e, c: 1 / 0)
+        runner.api.on("text_delta", lambda e, c: calls.append(3))  # never runs
+        with pytest.raises(ZeroDivisionError):
+            runner.fire("text_delta", {"text": "x"})
+        assert calls == [1]
+
+    def test_strict_toggleable_at_runtime(self):
+        runner = HookRunner()
+        runner.api.on("text_delta", lambda e, c: 1 / 0)
+        runner.fire("text_delta", {"text": "x"})  # off by default → swallowed
+        runner.strict = True
+        with pytest.raises(ZeroDivisionError):
+            runner.fire("text_delta", {"text": "x"})
+        runner.strict = False
+        runner.fire("text_delta", {"text": "x"})  # flipping back restores swallow
+
+    def test_strict_does_not_affect_successful_handlers(self):
+        runner = HookRunner()
+        runner.strict = True
+        runner.api.on("build_system_prompt", lambda e, c: {"system_prompt": "ok"})
+        result = runner.fire("build_system_prompt", {"cwd": "/"})
+        assert result == {"system_prompt": "ok"}
+
+    def test_strict_does_not_affect_declared_block_return(self):
+        """`block: True` is a valid return, not an exception — strict mode must
+        not turn a legitimate BLOCK short-circuit into an error."""
+        runner = HookRunner()
+        runner.strict = True
+        runner.api.on(
+            "user_prompt_submit", lambda e, c: {"block": True, "reason": "nope"}
+        )
+        result = runner.fire("user_prompt_submit", {"prompt": "x"})
+        assert result == {"block": True, "reason": "nope"}
+
+
+class TestChainMerge:
+    """CHAIN: each handler sees prior handlers' running result via the event
+    payload. Enables composition — two mutators stack instead of stomping."""
+
+    def test_single_handler_behaves_like_replace(self):
+        runner = HookRunner()
+        runner.api.register_event("e", Return("x", kind=Merge.CHAIN))
+        runner.api.on("e", lambda e, c: {"x": 1})
+        assert runner.fire("e", {}) == {"x": 1}
+
+    def test_second_handler_reads_first_result_from_payload(self):
+        """The defining behavior: the second handler's payload contains what
+        the first handler returned, so it can transform instead of overwrite."""
+        runner = HookRunner()
+        runner.api.register_event("e", Return("x", kind=Merge.CHAIN))
+        runner.api.on("e", lambda e, c: {"x": 1})
+        runner.api.on("e", lambda e, c: {"x": e["x"] + 10})
+        assert runner.fire("e", {})["x"] == 11
+
+    def test_first_handler_sees_initial_caller_payload(self):
+        """Before any handler has returned, the chained key reflects the
+        initial payload supplied by the caller."""
+        runner = HookRunner()
+        runner.api.register_event("e", Return("x", kind=Merge.CHAIN))
+        runner.api.on("e", lambda e, c: {"x": e.get("x", 0) + 1})
+        runner.api.on("e", lambda e, c: {"x": e["x"] * 2})
+        assert runner.fire("e", {"x": 5})["x"] == 12  # 5 → 6 → 12
+
+    def test_handler_that_omits_key_leaves_running_value_intact(self):
+        runner = HookRunner()
+        runner.api.register_event("e", Return("x", kind=Merge.CHAIN))
+        runner.api.on("e", lambda e, c: {"x": 7})
+        runner.api.on("e", lambda e, c: {"other": "ignored"})
+        runner.api.on("e", lambda e, c: {"x": e["x"] * 10})
+        assert runner.fire("e", {})["x"] == 70
+
+    def test_caller_payload_is_not_mutated(self):
+        """fire() copies the payload before iterating. A CHAIN-propagating
+        fire must not mutate the caller's dict — otherwise callers that
+        pass the same dict to multiple fires get surprising cross-talk."""
+        runner = HookRunner()
+        runner.api.register_event("e", Return("x", kind=Merge.CHAIN))
+        runner.api.on("e", lambda e, c: {"x": 99})
+        runner.api.on("e", lambda e, c: {"x": e["x"] + 1})
+        payload = {"x": 1}
+        runner.fire("e", payload)
+        assert payload == {"x": 1}
+
+    def test_chain_short_circuits_with_block(self):
+        """BLOCK wins over CHAIN: later handlers never run, the result
+        keeps the last chained value from before the block."""
+        runner = HookRunner()
+        runner.api.register_event("e", Return("x", kind=Merge.CHAIN), BLOCK, REASON)
+        runner.api.on("e", lambda e, c: {"x": 1})
+        runner.api.on("e", lambda e, c: {"block": True, "reason": "stop"})
+        runner.api.on("e", lambda e, c: {"x": 999})  # unreached
+        result = runner.fire("e", {})
+        assert result["block"] is True
+        assert result["x"] == 1
+
+    def test_builtin_chain_keys_on_registered_events(self):
+        """The five built-in CHAIN keys are: input (pre_tool_use), content
+        (post_tool_use), system/tools/messages (before_model_request)."""
+        runner = HookRunner()
+
+        def chain_keys(event: str) -> set[str]:
+            return {
+                r.key for r in runner.events[event].returns if r.kind is Merge.CHAIN
+            }
+
+        assert chain_keys("pre_tool_use") == {"input"}
+        assert chain_keys("post_tool_use") == {"content"}
+        assert chain_keys("before_model_request") == {"system", "tools", "messages"}
+
+    def test_two_before_model_request_mutators_compose(self):
+        """Real-world payoff: two hooks both transforming `system` no longer
+        stomp on each other. The second sees the first's markers intact."""
+        runner = HookRunner()
+
+        def add_marker(name):
+            return lambda e, c: {"system": e.get("system", "") + f" [{name}]"}
+
+        runner.api.on("before_model_request", add_marker("x"))
+        runner.api.on("before_model_request", add_marker("y"))
+
+        result = runner.fire(
+            "before_model_request",
+            {"system": "base", "tools": [], "messages": []},
+        )
+        assert result["system"] == "base [x] [y]"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -481,6 +702,58 @@ class TestSystemPromptHook:
         assert "reminder" not in result["system_prompt"].lower()
         assert "<system-reminder>" not in result["system_prompt"]
 
+    def test_date_captured_at_load_not_per_fire(self, monkeypatch):
+        """date.today() is closed over at hook load — firing after a date change
+        must not update the prompt, so the cached prefix survives midnight."""
+        import agent
+        from types import SimpleNamespace
+
+        def fake(iso):
+            return SimpleNamespace(today=lambda: SimpleNamespace(isoformat=lambda: iso))
+
+        monkeypatch.setattr(agent, "date", fake("2026-05-11"))
+        runner = HookRunner()
+        runner.load(system_prompt_hook)
+
+        # Jump the clock forward a day. The already-loaded hook should ignore it.
+        monkeypatch.setattr(agent, "date", fake("2026-05-12"))
+        prompt = runner.fire("build_system_prompt", {"cwd": "/"})["system_prompt"]
+
+        assert "Current date: 2026-05-11" in prompt
+        assert "2026-05-12" not in prompt
+
+    def test_date_stable_across_multiple_fires(self):
+        """Same prompt string on every fire — a fresh date.today() per call
+        would break prefix cache hits within a long-lived process."""
+        runner = HookRunner()
+        runner.load(system_prompt_hook)
+        a = runner.fire("build_system_prompt", {"cwd": "/tmp"})["system_prompt"]
+        b = runner.fire("build_system_prompt", {"cwd": "/tmp"})["system_prompt"]
+        c = runner.fire("build_system_prompt", {"cwd": "/tmp"})["system_prompt"]
+        assert a == b == c
+
+    def test_two_hook_loads_get_independent_dates(self, monkeypatch):
+        """Each call to system_prompt_hook(api) captures its own date —
+        loading twice with different clocks produces different prompts."""
+        import agent
+        from types import SimpleNamespace
+
+        def fake(iso):
+            return SimpleNamespace(today=lambda: SimpleNamespace(isoformat=lambda: iso))
+
+        monkeypatch.setattr(agent, "date", fake("2026-01-01"))
+        r1 = HookRunner()
+        r1.load(system_prompt_hook)
+
+        monkeypatch.setattr(agent, "date", fake("2027-01-01"))
+        r2 = HookRunner()
+        r2.load(system_prompt_hook)
+
+        p1 = r1.fire("build_system_prompt", {"cwd": "/"})["system_prompt"]
+        p2 = r2.fire("build_system_prompt", {"cwd": "/"})["system_prompt"]
+        assert "2026-01-01" in p1 and "2027-01-01" not in p1
+        assert "2027-01-01" in p2 and "2026-01-01" not in p2
+
 
 class TestToolHooks:
     @pytest.mark.parametrize(
@@ -505,37 +778,39 @@ class TestResumeHook:
 
         return Namespace(new=new, session=session)
 
-    def test_default_picks_most_recent(self, tmp_path):
+    def _session_dir(self, tmp_path, monkeypatch, *, create=True):
+        """Arrange HOME + cwd so resume_hook's `_session_dir(os.getcwd())`
+        lands in a clean tmp location. Returns the session dir path."""
+        from agent import _session_dir
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.chdir(tmp_path)
+        d = _session_dir(str(tmp_path))
+        if create:
+            d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def test_default_picks_most_recent(self, tmp_path, monkeypatch):
         """Default (no flag) resumes the most recent session."""
-        f1 = tmp_path / "s1.jsonl"
+        d = self._session_dir(tmp_path, monkeypatch)
+        f1 = d / "s1.jsonl"
         f1.write_text('{"type":"header"}\n')
-        f2 = tmp_path / "s2.jsonl"
+        f2 = d / "s2.jsonl"
         f2.write_text('{"type":"header"}\n')
         # f2 is the newer file (written second, newer mtime)
 
         runner = HookRunner()
         runner.load(resume_hook)
-        result = runner.fire(
-            "before_session_load",
-            {
-                "args": self._fake_args(),
-                "default_path": tmp_path / "new.jsonl",
-            },
-        )
+        result = runner.fire("before_session_load", {"args": self._fake_args()})
         assert result["path"] == f2
 
-    def test_new_flag_forces_fresh_session(self, tmp_path):
+    def test_new_flag_forces_fresh_session(self, tmp_path, monkeypatch):
         """--new bypasses resume even when prior sessions exist."""
-        (tmp_path / "old.jsonl").write_text('{"type":"header"}\n')
+        d = self._session_dir(tmp_path, monkeypatch)
+        (d / "old.jsonl").write_text('{"type":"header"}\n')
         runner = HookRunner()
         runner.load(resume_hook)
-        result = runner.fire(
-            "before_session_load",
-            {
-                "args": self._fake_args(new=True),
-                "default_path": tmp_path / "new.jsonl",
-            },
-        )
+        result = runner.fire("before_session_load", {"args": self._fake_args(new=True)})
         assert "path" not in result
 
     def test_session_flag_picks_explicit(self, tmp_path):
@@ -544,36 +819,110 @@ class TestResumeHook:
         runner = HookRunner()
         runner.load(resume_hook)
         result = runner.fire(
-            "before_session_load",
-            {
-                "args": self._fake_args(session=f),
-                "default_path": tmp_path / "new.jsonl",
-            },
+            "before_session_load", {"args": self._fake_args(session=f)}
         )
         assert result["path"] == f
 
-    def test_default_with_no_prior_sessions_starts_fresh(self, tmp_path):
-        """Empty session dir → no override, main() creates a new session."""
+    def test_default_with_no_prior_sessions_starts_fresh(self, tmp_path, monkeypatch):
+        """Empty session dir → no override, main() falls back to session_path_hook."""
+        self._session_dir(tmp_path, monkeypatch)  # dir exists but empty
         runner = HookRunner()
         runner.load(resume_hook)
-        result = runner.fire(
-            "before_session_load",
-            {"args": self._fake_args(), "default_path": tmp_path / "new.jsonl"},
-        )
+        result = runner.fire("before_session_load", {"args": self._fake_args()})
         assert "path" not in result
 
-    def test_default_with_missing_session_dir_starts_fresh(self, tmp_path):
+    def test_default_with_missing_session_dir_starts_fresh(self, tmp_path, monkeypatch):
         """First-ever run: session dir doesn't exist yet → start fresh."""
+        self._session_dir(tmp_path, monkeypatch, create=False)
         runner = HookRunner()
         runner.load(resume_hook)
-        result = runner.fire(
-            "before_session_load",
-            {
-                "args": self._fake_args(),
-                "default_path": tmp_path / "does-not-exist" / "new.jsonl",
-            },
-        )
+        result = runner.fire("before_session_load", {"args": self._fake_args()})
         assert "path" not in result
+
+
+class TestSessionPathHook:
+    """Provides the default `{session_dir}/{timestamp}_{uuid}.jsonl` path on
+    `before_session_load`. resume_hook registers a later handler that
+    overrides this default when a prior session exists."""
+
+    def _arrange(self, tmp_path, monkeypatch):
+        from agent import _session_dir
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.chdir(tmp_path)
+        return _session_dir(str(tmp_path))
+
+    def test_provides_default_path(self, tmp_path, monkeypatch):
+        session_dir = self._arrange(tmp_path, monkeypatch)
+        runner = HookRunner()
+        runner.load(session_path_hook)
+        result = runner.fire("before_session_load", {"args": None})
+        assert "path" in result
+        assert result["path"].parent == session_dir
+        assert result["path"].suffix == ".jsonl"
+
+    def test_path_is_unique_per_fire(self, tmp_path, monkeypatch):
+        """Each fire generates a fresh timestamp + uuid tail. Rapid succession
+        must still yield distinct paths so concurrent sessions don't collide."""
+        self._arrange(tmp_path, monkeypatch)
+        runner = HookRunner()
+        runner.load(session_path_hook)
+        a = runner.fire("before_session_load", {"args": None})["path"]
+        b = runner.fire("before_session_load", {"args": None})["path"]
+        assert a != b
+
+    def test_default_overridden_by_resume(self, tmp_path, monkeypatch):
+        """session_path_hook's default must lose to resume_hook's explicit
+        --session path — the REPLACE semantics of PATH + registration order
+        let resume win."""
+        from argparse import Namespace
+
+        self._arrange(tmp_path, monkeypatch)
+        chosen = tmp_path / "chosen.jsonl"
+        chosen.write_text('{"type":"header"}\n')
+
+        runner = HookRunner()
+        runner.load(session_path_hook)
+        runner.load(resume_hook)
+        args = Namespace(new=False, session=chosen)
+        result = runner.fire("before_session_load", {"args": args})
+        assert result["path"] == chosen
+
+    def test_default_survives_when_resume_declines(self, tmp_path, monkeypatch):
+        """--new tells resume_hook to return None; the default must survive."""
+        from argparse import Namespace
+
+        session_dir = self._arrange(tmp_path, monkeypatch)
+        runner = HookRunner()
+        runner.load(session_path_hook)
+        runner.load(resume_hook)
+        args = Namespace(new=True, session=None)
+        result = runner.fire("before_session_load", {"args": args})
+        assert result["path"].parent == session_dir
+
+
+class TestAnthropicClientHook:
+    """Provides an `AsyncAnthropic` client via `build_session_config`."""
+
+    def test_provides_client(self, monkeypatch):
+        from anthropic import AsyncAnthropic
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+        runner = HookRunner()
+        runner.load(anthropic_client_hook)
+        result = runner.fire("build_session_config", {})
+        assert isinstance(result["client"], AsyncAnthropic)
+
+    def test_each_fire_produces_fresh_client(self, monkeypatch):
+        """Not memoized — each fire returns a new client. Fine in practice
+        because main() fires once; the assertion pins the behavior so a
+        future memoization is a deliberate choice, not an accident."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+        runner = HookRunner()
+        runner.load(anthropic_client_hook)
+        a = runner.fire("build_session_config", {})["client"]
+        b = runner.fire("build_session_config", {})["client"]
+        assert a is not b
 
 
 class TestListSessionsHook:
@@ -846,7 +1195,11 @@ class TestUIHook:
         runner.load(ui_hook)
         f = tmp_path / "f.txt"
         f.write_text("a\nold\nc\n")
-        runner.fire("pre_tool_use", {"name": "edit", "input": {"path": str(f)}})
+        state: dict = {}
+        runner.fire(
+            "pre_tool_use",
+            {"name": "edit", "input": {"path": str(f)}, "state": state},
+        )
         f.write_text("a\nnew\nc\n")
         runner.fire(
             "post_tool_use",
@@ -855,12 +1208,325 @@ class TestUIHook:
                 "input": {"path": str(f)},
                 "content": "edited",
                 "is_error": False,
+                "state": state,
             },
         )
         out = capsys.readouterr().out
         assert "Update" in out
         assert "old" in out and "new" in out
         assert "+1" in out and "-1" in out
+
+    def test_edit_diff_preserves_bracket_content(self, tmp_path, capsys):
+        """Rich treats [anything] as markup. Without escaping, a Rust attribute
+        like `#[allow(dead_code)]` renders as just `#` because Rich swallows
+        the bracket content as an (invalid) style tag. Also bites Python
+        type hints (`list[str]`), docstring refs, etc."""
+        runner = HookRunner()
+        self._register_tools(runner)
+        runner.load(ui_hook)
+        f = tmp_path / "f.rs"
+        f.write_text("pub async fn work() {}\n")
+        state: dict = {}
+        runner.fire(
+            "pre_tool_use",
+            {"id": "t1", "name": "edit", "input": {"path": str(f)}, "state": state},
+        )
+        f.write_text("#[allow(dead_code)]\npub async fn work() {}\n")
+        runner.fire(
+            "post_tool_use",
+            {
+                "id": "t1",
+                "name": "edit",
+                "input": {"path": str(f)},
+                "content": "ok",
+                "is_error": False,
+                "state": state,
+            },
+        )
+        out = capsys.readouterr().out
+        assert (
+            "#[allow(dead_code)]" in out
+        ), f"Rich markup ate the attribute — output was:\n{out}"
+
+    def test_interleaved_pre_calls_attribute_diffs_by_id(self, tmp_path, capsys):
+        """Two edits in flight simultaneously: pre(t1), pre(t2), post(t1), post(t2).
+        Each call carries its own `state` dict (as agent_loop would create),
+        so diffs never cross-attribute — and unlike the old id-keyed stack,
+        there's no shared dict in ui_hook that could desync."""
+        runner = HookRunner()
+        self._register_tools(runner)
+        runner.load(ui_hook)
+
+        f_alpha = tmp_path / "alpha.txt"
+        f_alpha.write_text("ALPHAOLD\n")
+        f_beta = tmp_path / "beta.txt"
+        f_beta.write_text("BETAOLD\n")
+
+        state_t1: dict = {}
+        state_t2: dict = {}
+        runner.fire(
+            "pre_tool_use",
+            {
+                "id": "t1",
+                "name": "edit",
+                "input": {"path": str(f_alpha)},
+                "state": state_t1,
+            },
+        )
+        runner.fire(
+            "pre_tool_use",
+            {
+                "id": "t2",
+                "name": "edit",
+                "input": {"path": str(f_beta)},
+                "state": state_t2,
+            },
+        )
+        f_alpha.write_text("ALPHANEW\n")
+        f_beta.write_text("BETANEW\n")
+        runner.fire(
+            "post_tool_use",
+            {
+                "id": "t1",
+                "name": "edit",
+                "input": {"path": str(f_alpha)},
+                "content": "ok",
+                "is_error": False,
+                "state": state_t1,
+            },
+        )
+        runner.fire(
+            "post_tool_use",
+            {
+                "id": "t2",
+                "name": "edit",
+                "input": {"path": str(f_beta)},
+                "content": "ok",
+                "is_error": False,
+                "state": state_t2,
+            },
+        )
+
+        out = capsys.readouterr().out
+        for token in ("ALPHAOLD", "ALPHANEW", "BETAOLD", "BETANEW"):
+            assert out.count(token) == 1, f"{token} not printed exactly once:\n{out}"
+
+        i_ao = out.index("ALPHAOLD")
+        i_an = out.index("ALPHANEW")
+        i_bo = out.index("BETAOLD")
+        i_bn = out.index("BETANEW")
+        assert (
+            i_ao < i_an < i_bo < i_bn
+        ), f"diffs mis-attributed across interleaved calls:\n{out}"
+
+    def test_render_call_exception_does_not_desync_other_tools(self, tmp_path, capsys):
+        """A raising render_call must not contaminate another tool's state.
+        Each call has its own state dict by construction, so corruption of
+        flaky's dict can't reach edit's dict."""
+
+        def render_boom(_tool, _args, _console, _state):
+            raise RuntimeError("boom")
+
+        flaky = Tool(
+            name="flaky",
+            description="",
+            schema={"type": "object"},
+            execute=lambda a: ("ok", False),
+            render_call=render_boom,
+        )
+        runner = HookRunner()
+        runner.api.register_tool(flaky)
+        self._register_tools(runner)  # adds real `edit`
+        runner.load(ui_hook)
+
+        f = tmp_path / "f.txt"
+        f.write_text("before\n")
+
+        flaky_state: dict = {}
+        edit_state: dict = {}
+        runner.fire(
+            "pre_tool_use",
+            {"id": "flaky-1", "name": "flaky", "input": {}, "state": flaky_state},
+        )
+        runner.fire(
+            "pre_tool_use",
+            {
+                "id": "edit-1",
+                "name": "edit",
+                "input": {"path": str(f)},
+                "state": edit_state,
+            },
+        )
+        f.write_text("after\n")
+        runner.fire(
+            "post_tool_use",
+            {
+                "id": "flaky-1",
+                "name": "flaky",
+                "input": {},
+                "content": "ok",
+                "is_error": False,
+                "state": flaky_state,
+            },
+        )
+        runner.fire(
+            "post_tool_use",
+            {
+                "id": "edit-1",
+                "name": "edit",
+                "input": {"path": str(f)},
+                "content": "ok",
+                "is_error": False,
+                "state": edit_state,
+            },
+        )
+
+        out = capsys.readouterr().out
+        assert "before" in out and "after" in out
+        assert "+1" in out and "-1" in out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Per-tool-call state bag — shared dict threaded through pre/post events
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestToolState:
+    """`state` is a dict passed through pre_tool_use and post_tool_use events
+    for the same tool call. Renderers stash data for themselves; other hooks
+    (telemetry, instrumentation) can participate without special plumbing."""
+
+    def _minimal_tool(self, **kwargs) -> Tool:
+        return Tool(
+            name=kwargs.pop("name", "t"),
+            description="",
+            schema={},
+            execute=lambda a: ("ok", False),
+            **kwargs,
+        )
+
+    def test_render_call_stashes_value_read_by_render_result(self):
+        seen: list = []
+
+        def on_call(_tool, _args, _console, state):
+            state["marker"] = "call-was-here"
+
+        def on_result(_tool, _args, _content, _is_error, _console, state):
+            seen.append(state.get("marker"))
+
+        runner = HookRunner()
+        runner.api.register_tool(
+            self._minimal_tool(render_call=on_call, render_result=on_result)
+        )
+        runner.load(ui_hook)
+
+        state: dict = {}
+        runner.fire(
+            "pre_tool_use", {"id": "x", "name": "t", "input": {}, "state": state}
+        )
+        runner.fire(
+            "post_tool_use",
+            {
+                "id": "x",
+                "name": "t",
+                "input": {},
+                "content": "",
+                "is_error": False,
+                "state": state,
+            },
+        )
+        assert seen == ["call-was-here"]
+
+    def test_non_renderer_hook_can_contribute_to_state(self):
+        """A hook with no renderer can stash data into `state` during
+        pre_tool_use and have a renderer read it in post_tool_use."""
+        durations: list = []
+
+        def on_result(_tool, _args, _content, _is_error, _console, state):
+            durations.append(state.get("tag"))
+
+        runner = HookRunner()
+        runner.api.register_tool(self._minimal_tool(render_result=on_result))
+        runner.load(ui_hook)
+
+        def stamp(event, _ctx):
+            event["state"]["tag"] = "stamped-by-non-renderer"
+
+        runner.api.on("pre_tool_use", stamp)
+
+        state: dict = {}
+        runner.fire(
+            "pre_tool_use", {"id": "x", "name": "t", "input": {}, "state": state}
+        )
+        runner.fire(
+            "post_tool_use",
+            {
+                "id": "x",
+                "name": "t",
+                "input": {},
+                "content": "",
+                "is_error": False,
+                "state": state,
+            },
+        )
+        assert durations == ["stamped-by-non-renderer"]
+
+    def test_each_tool_use_has_isolated_state(self):
+        """Two concurrent calls must not share state — the caller (agent_loop)
+        is responsible for supplying a fresh dict per tool_use."""
+        observations: list = []
+
+        def on_call(_tool, args, _console, state):
+            state["pre"] = args["tag"]
+
+        def on_result(_tool, args, _content, _is_error, _console, state):
+            observations.append((args["tag"], state.get("pre")))
+
+        runner = HookRunner()
+        runner.api.register_tool(
+            self._minimal_tool(render_call=on_call, render_result=on_result)
+        )
+        runner.load(ui_hook)
+
+        state_a: dict = {}
+        state_b: dict = {}
+        for id_, tag, state in [("a", "A", state_a), ("b", "B", state_b)]:
+            runner.fire(
+                "pre_tool_use",
+                {"id": id_, "name": "t", "input": {"tag": tag}, "state": state},
+            )
+        for id_, tag, state in [("a", "A", state_a), ("b", "B", state_b)]:
+            runner.fire(
+                "post_tool_use",
+                {
+                    "id": id_,
+                    "name": "t",
+                    "input": {"tag": tag},
+                    "content": "",
+                    "is_error": False,
+                    "state": state,
+                },
+            )
+        assert observations == [("A", "A"), ("B", "B")]
+
+    def test_missing_state_falls_back_to_fresh_empty_dict(self):
+        """Tests (and any caller not bothering to share state) still work —
+        ui_hook defaults to an empty dict per call. Just no cross-phase sharing."""
+        runner = HookRunner()
+        runner.api.register_tool(self._minimal_tool())
+        runner.load(ui_hook)
+        # Should not raise.
+        runner.fire("pre_tool_use", {"id": "x", "name": "t", "input": {}})
+        runner.fire(
+            "post_tool_use",
+            {
+                "id": "x",
+                "name": "t",
+                "input": {},
+                "content": "ok",
+                "is_error": False,
+            },
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -896,6 +1562,141 @@ class TestAgentSessionLifecycle:
         agent = AgentSession(client=None, model="m", session=sm, runner=runner)  # type: ignore[arg-type]
         agent.start()
         assert agent.pending_reminders == ["be careful"]
+
+    def test_max_turns_defaults_to_25(self, tmp_path):
+        sm = SessionManager(tmp_path / "s.jsonl")
+        agent = AgentSession(client=None, model="m", session=sm)  # type: ignore[arg-type]
+        assert agent.max_turns == 25
+
+    def test_max_turns_override(self, tmp_path):
+        sm = SessionManager(tmp_path / "s.jsonl")
+        agent = AgentSession(client=None, model="m", session=sm, max_turns=100)  # type: ignore[arg-type]
+        assert agent.max_turns == 100
+
+    def test_max_turns_threaded_to_agent_loop(self, tmp_path, monkeypatch):
+        """AgentSession.prompt must forward max_turns as the 8th positional arg
+        to agent_loop — otherwise the flag silently has no effect."""
+        import agent as agent_mod
+        import asyncio
+
+        captured = {}
+
+        async def fake_agent_loop(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+
+        monkeypatch.setattr(agent_mod, "agent_loop", fake_agent_loop)
+
+        sm = SessionManager(tmp_path / "s.jsonl")
+        runner = HookRunner()
+        agent = AgentSession(
+            client=None, model="m", session=sm, runner=runner, max_turns=7
+        )  # type: ignore[arg-type]
+        asyncio.run(agent.prompt("hi"))
+
+        # Position 7 (0-indexed) is pending_reminders; position 8 is max_turns.
+        # We assert by value rather than by index to stay robust to signature churn.
+        all_vals = list(captured["args"]) + list(captured["kwargs"].values())
+        assert 7 in all_vals, (
+            f"max_turns=7 not forwarded to agent_loop: args={captured['args']} "
+            f"kwargs={captured['kwargs']}"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Runtime flag hooks — model_flag_hook, max_turns_flag_hook, strict_hooks_flag_hook
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestModelFlag:
+    def _loaded(self):
+        runner = HookRunner()
+        runner.load(model_flag_hook)
+        return runner
+
+    def test_default(self):
+        args = self._loaded().parser.parse_args([])
+        assert args.model == "claude-sonnet-4-6"
+
+    def test_override(self):
+        args = self._loaded().parser.parse_args(
+            ["--model", "claude-haiku-4-5-20251001"]
+        )
+        assert args.model == "claude-haiku-4-5-20251001"
+
+    def test_contributes_to_build_session_config(self):
+        runner = self._loaded()
+        args = runner.parser.parse_args(["--model", "custom-m"])
+        result = runner.fire("build_session_config", {"args": args})
+        assert result == {"model": "custom-m"}
+
+
+class TestMaxTurnsFlag:
+    def _loaded(self):
+        runner = HookRunner()
+        runner.load(max_turns_flag_hook)
+        return runner
+
+    def test_default(self):
+        args = self._loaded().parser.parse_args([])
+        assert args.max_turns == 25
+
+    def test_override(self):
+        args = self._loaded().parser.parse_args(["--max-turns", "50"])
+        assert args.max_turns == 50
+
+    def test_rejects_non_int(self):
+        runner = self._loaded()
+        with pytest.raises(SystemExit):
+            runner.parser.parse_args(["--max-turns", "not-a-number"])
+
+    def test_contributes_to_build_session_config(self):
+        runner = self._loaded()
+        args = runner.parser.parse_args(["--max-turns", "50"])
+        result = runner.fire("build_session_config", {"args": args})
+        assert result == {"max_turns": 50}
+
+
+class TestStrictHooksFlag:
+    """--strict-hooks carries behavior in addition to a flag value: an
+    args_parsed handler copies it into runner.strict. Each step has its
+    own assertion so a regression points at the broken link."""
+
+    def _loaded(self):
+        runner = HookRunner()
+        runner.load(strict_hooks_flag_hook)
+        return runner
+
+    def test_default_false(self):
+        args = self._loaded().parser.parse_args([])
+        assert args.strict_hooks is False
+
+    def test_flag_sets_true(self):
+        args = self._loaded().parser.parse_args(["--strict-hooks"])
+        assert args.strict_hooks is True
+
+    def test_args_parsed_applies_strict_to_runner(self):
+        runner = self._loaded()
+        args = runner.parser.parse_args(["--strict-hooks"])
+        assert runner.strict is False  # not yet applied
+        runner.fire("args_parsed", {"args": args})
+        assert runner.strict is True
+
+    def test_args_parsed_preserves_non_strict_default(self):
+        runner = self._loaded()
+        args = runner.parser.parse_args([])
+        runner.fire("args_parsed", {"args": args})
+        assert runner.strict is False
+
+    def test_end_to_end(self):
+        """Parse --strict-hooks, fire args_parsed, then a raising handler
+        propagates instead of being logged."""
+        runner = self._loaded()
+        args = runner.parser.parse_args(["--strict-hooks"])
+        runner.fire("args_parsed", {"args": args})
+        runner.api.on("text_delta", lambda e, c: 1 / 0)
+        with pytest.raises(ZeroDivisionError):
+            runner.fire("text_delta", {"text": "x"})
 
 
 # ═══════════════════════════════════════════════════════════════════════════
