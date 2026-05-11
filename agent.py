@@ -190,16 +190,37 @@ class Tool:
 def _read_tool() -> Tool:
     def execute(args: dict) -> tuple[str, bool]:
         try:
-            return Path(args["path"]).read_text(), False
+            lines = Path(args["path"]).read_text().splitlines()
+            offset = max(int(args.get("offset", 0)), 0)
+            limit = max(int(args.get("limit", 2000)), 1)
+            chunk = lines[offset : offset + limit]
+            width = len(str(offset + len(chunk))) if chunk else 1
+            numbered = "\n".join(
+                f"{offset + i + 1:>{width}}\t{line}" for i, line in enumerate(chunk)
+            )
+            remaining = len(lines) - offset - len(chunk)
+            if remaining > 0:
+                numbered += f"\n... ({remaining} more lines; pass offset={offset + len(chunk)} to continue)"
+            return numbered or "(empty)", False
         except Exception as e:
             return f"{type(e).__name__}: {e}", True
 
     return Tool(
         name="read",
-        description="Read a file from disk. Returns the full text.",
+        description=(
+            "Read a file from disk. Returns lines prefixed with 1-based line numbers "
+            "separated by a tab (e.g. '  12\\tfoo'). Optional `offset` (0-based line "
+            "index, default 0) and `limit` (default 2000) page through large files. "
+            "The line-number prefix is display only — never include it in `edit`'s "
+            "`old` or `write`'s `content`."
+        ),
         schema={
             "type": "object",
-            "properties": {"path": {"type": "string"}},
+            "properties": {
+                "path": {"type": "string"},
+                "offset": {"type": "integer", "minimum": 0},
+                "limit": {"type": "integer", "minimum": 1},
+            },
             "required": ["path"],
         },
         execute=execute,
@@ -269,9 +290,11 @@ def _edit_tool() -> Tool:
     return Tool(
         name="edit",
         description=(
-            "Replace `old` with `new` in a file. `old` must appear exactly once. "
-            "When deleting a whole line, include its trailing newline in `old` "
-            "(e.g. old='foo\\n', new='') — otherwise a blank line is left behind."
+            "Replace `old` with `new` in a file. `old` must appear exactly once and "
+            "must match raw file bytes — do not include the '<n>\\t' line-number "
+            "prefix that `read` adds for display. When deleting a whole line, include "
+            "its trailing newline in `old` (e.g. old='foo\\n', new='') — otherwise a "
+            "blank line is left behind."
         ),
         schema={
             "type": "object",
@@ -593,6 +616,7 @@ Rules:
 - Always `read` a file before you `write` or `edit` it.
 - Prefer `edit` for small changes. Only `write` for new files or full rewrites.
 - If a tool errors, read the error and try again.
+- Verify results with tools before claiming done (re-read the file after editing, run the test, check the exit code).
 - Keep replies short. Explain what you did, not what you're about to do.
 
 Current date: {today}

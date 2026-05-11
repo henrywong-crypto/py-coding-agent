@@ -541,7 +541,29 @@ class TestReadTool:
         f = tmp_path / "a.txt"
         f.write_text("hello")
         content, err = _read_tool().execute({"path": str(f)})
-        assert content == "hello" and err is False
+        assert content == "1\thello" and err is False
+
+    def test_numbers_multiple_lines(self, tmp_path):
+        f = tmp_path / "a.txt"
+        f.write_text("one\ntwo\nthree")
+        content, err = _read_tool().execute({"path": str(f)})
+        assert err is False
+        assert content == "1\tone\n2\ttwo\n3\tthree"
+
+    def test_offset_and_limit_paginate(self, tmp_path):
+        f = tmp_path / "a.txt"
+        f.write_text("\n".join(str(i) for i in range(1, 11)))
+        content, err = _read_tool().execute({"path": str(f), "offset": 3, "limit": 2})
+        assert err is False
+        assert content.startswith("4\t4\n5\t5")
+        assert "5 more lines" in content
+        assert "offset=5" in content
+
+    def test_empty_file(self, tmp_path):
+        f = tmp_path / "a.txt"
+        f.write_text("")
+        content, err = _read_tool().execute({"path": str(f)})
+        assert err is False and content == "(empty)"
 
     def test_missing_file_returns_error(self, tmp_path):
         content, err = _read_tool().execute({"path": str(tmp_path / "nope")})
@@ -1791,13 +1813,20 @@ class TestFuzzTools:
         # \r is excluded because Python's text-mode read translates \r and
         # \r\n to \n (universal newlines). That's a read_text quirk, not an
         # agent bug — write_text + read_text both use text mode by default.
+        # read now adds "<n>\t" line-number prefixes; strip them to recover
+        # the lines. splitlines() drops the trailing newline, so we compare
+        # against content.splitlines() rather than content itself.
         with tempfile.TemporaryDirectory() as d:
             f = Path(d) / "rt.txt"
             _, wr_err = _write_tool().execute({"path": str(f), "content": content})
             assert wr_err is False
             out, rd_err = _read_tool().execute({"path": str(f)})
             assert rd_err is False
-            assert out == content
+            if not content:
+                assert out == "(empty)"
+                return
+            recovered = [line.split("\t", 1)[1] for line in out.splitlines()]
+            assert recovered == content.splitlines()
 
     @given(
         original=st.text(min_size=1, max_size=100), replacement=st.text(max_size=100)
