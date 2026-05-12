@@ -38,6 +38,7 @@ class Merge(Enum):
     ACCUMULATE = "accumulate"
     BLOCK = "block"
     CHAIN = "chain"
+    UPDATE = "update"  # shallow dict-merge across handlers
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,7 @@ MESSAGES = Return("messages", kind=Merge.CHAIN)
 MODEL = Return("model")
 MAX_TURNS = Return("max_turns")
 CLIENT = Return("client")
+EXTRA = Return("extra", kind=Merge.UPDATE)
 
 
 @dataclass(frozen=True)
@@ -157,6 +159,8 @@ class HookRunner:
                     }
                 if ret.kind is Merge.ACCUMULATE:
                     result.setdefault(ret.key, []).append(r[ret.key])
+                elif ret.kind is Merge.UPDATE:
+                    result.setdefault(ret.key, {}).update(r[ret.key] or {})
                 else:
                     result[ret.key] = r[ret.key]
         return result
@@ -188,20 +192,42 @@ class Tool:
 
 
 def _read_tool() -> Tool:
+    MAX_BYTES = 50 * 1024  # pi-mono-style byte cap, whole-line boundary
+
     def execute(args: dict) -> tuple[str, bool]:
         try:
             lines = Path(args["path"]).read_text().splitlines()
             offset = max(int(args.get("offset", 0)), 0)
-            limit = max(int(args.get("limit", 2000)), 1)
+            limit = max(int(args.get("limit", 500)), 1)
             chunk = lines[offset : offset + limit]
-            width = len(str(offset + len(chunk))) if chunk else 1
+            if not chunk:
+                return "(empty)", False
+            # Byte-cap: keep whole lines whose cumulative size ≤ MAX_BYTES.
+            kept: list[str] = []
+            used = 0
+            for line in chunk:
+                size = len(line.encode("utf-8")) + (1 if kept else 0)  # +1 for \n
+                if used + size > MAX_BYTES:
+                    break
+                kept.append(line)
+                used += size
+            if not kept:
+                return (
+                    f"(line {offset + 1} alone exceeds the {MAX_BYTES // 1024}KB byte cap; "
+                    f"try `bash` with `sed -n '{offset + 1}p' <file> | head -c {MAX_BYTES}`)",
+                    False,
+                )
+            width = len(str(offset + len(kept)))
             numbered = "\n".join(
-                f"{offset + i + 1:>{width}}\t{line}" for i, line in enumerate(chunk)
+                f"{offset + i + 1:>{width}}\t{line}" for i, line in enumerate(kept)
             )
-            remaining = len(lines) - offset - len(chunk)
+            remaining = len(lines) - offset - len(kept)
             if remaining > 0:
-                numbered += f"\n... ({remaining} more lines; pass offset={offset + len(chunk)} to continue)"
-            return numbered or "(empty)", False
+                numbered += (
+                    f"\n... ({remaining} more lines; "
+                    f"pass offset={offset + len(kept)} to continue)"
+                )
+            return numbered, False
         except Exception as e:
             return f"{type(e).__name__}: {e}", True
 
@@ -210,7 +236,8 @@ def _read_tool() -> Tool:
         description=(
             "Read a file from disk. Returns lines prefixed with 1-based line numbers "
             "separated by a tab (e.g. '  12\\tfoo'). Optional `offset` (0-based line "
-            "index, default 0) and `limit` (default 2000) page through large files. "
+            "index, default 0) and `limit` (default 500) page through large files; "
+            "output is additionally capped at 50KB on a whole-line boundary. "
             "The line-number prefix is display only — never include it in `edit`'s "
             "`old` or `write`'s `content`."
         ),
@@ -436,19 +463,20 @@ async def agent_loop(
             "messages": session.to_messages(),
         }
         override = runner.fire("before_model_request", payload, ctx)
+        extras = dict(override.get("extra", {}))
+        max_tokens = extras.pop("max_tokens", 64000)
         final = {
             "system": override.get("system", payload["system"]),
             "tools": override.get("tools", payload["tools"]),
             "messages": override.get("messages", payload["messages"]),
+            **extras,
         }
         runner.fire("model_request_prepared", final, ctx)
 
         async with client.messages.stream(
             model=model,
-            max_tokens=4096,
-            system=final["system"],
-            tools=final["tools"],
-            messages=final["messages"],
+            max_tokens=max_tokens,
+            **final,
         ) as stream:
             had_text = False
             async for text in stream.text_stream:
@@ -578,7 +606,7 @@ def lifecycle_hook(api: HookAPI) -> None:
     api.register_event("user_prompt_submit", BLOCK, REASON, ADDITIONAL_CONTEXT)
     api.register_event("turn_start")
     api.register_event("build_system_prompt", SYSTEM_PROMPT, ADDITIONAL_CONTEXT)
-    api.register_event("before_model_request", SYSTEM, TOOLS, MESSAGES)
+    api.register_event("before_model_request", SYSTEM, TOOLS, MESSAGES, EXTRA)
     api.register_event("model_request_prepared")
     api.register_event("text_delta")
     api.register_event("text_end")
@@ -661,6 +689,64 @@ def max_turns_flag_hook(api: HookAPI) -> None:
         return {"max_turns": event["args"].max_turns}
 
     api.on("build_session_config", provide)
+
+
+def _stream_extra_hook(
+    api: HookAPI,
+    build: Callable[[argparse.Namespace], dict | None],
+    *flag_args: Any,
+    **flag_kwargs: Any,
+) -> None:
+    """Shared shape: register a flag, read parsed args, contribute to `extra`.
+
+    `build(args)` returns a dict to merge into the stream kwargs (e.g.
+    `{"thinking": {...}}`), or a falsy value to skip.
+    """
+    api.register_flag(*flag_args, **flag_kwargs)
+    cell: dict[str, argparse.Namespace] = {}
+
+    def capture(event: dict, _ctx: dict) -> None:
+        cell["args"] = event["args"]
+
+    def inject(_event: dict, _ctx: dict) -> dict:
+        args = cell.get("args")
+        extra = build(args) if args is not None else None
+        return {"extra": extra} if extra else {}
+
+    api.on("args_parsed", capture)
+    api.on("before_model_request", inject)
+
+
+def max_tokens_flag_hook(api: HookAPI) -> None:
+    """--max-tokens N — caps the per-response output budget (default 64000)."""
+    _stream_extra_hook(
+        api,
+        lambda a: {"max_tokens": a.max_tokens},
+        "--max-tokens",
+        type=int,
+        default=64000,
+    )
+
+
+def thinking_hook(api: HookAPI) -> None:
+    """--thinking-display VALUE — adaptive thinking, always on (default 'summarized')."""
+    _stream_extra_hook(
+        api,
+        lambda a: {"thinking": {"type": "adaptive", "display": a.thinking_display}},
+        "--thinking-display",
+        default="summarized",
+    )
+
+
+def output_effort_hook(api: HookAPI) -> None:
+    """--effort LEVEL — sets output_config.effort (default 'xhigh')."""
+    _stream_extra_hook(
+        api,
+        lambda a: {"output_config": {"effort": a.effort}},
+        "--effort",
+        choices=("low", "medium", "high", "xhigh"),
+        default="xhigh",
+    )
 
 
 def strict_hooks_flag_hook(api: HookAPI) -> None:
@@ -1025,6 +1111,9 @@ HOOKS = (
     prompt_arg_hook,
     model_flag_hook,
     max_turns_flag_hook,
+    max_tokens_flag_hook,
+    thinking_hook,
+    output_effort_hook,
     strict_hooks_flag_hook,
     session_history_hook,
     prompt_toolkit_hook,

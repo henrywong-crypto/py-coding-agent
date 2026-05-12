@@ -48,6 +48,7 @@ from agent import (
     _bash_tool,
     _edit_tool,
     _read_tool,
+    _stream_extra_hook,
     _write_tool,
     # hooks
     anthropic_cache_hook,
@@ -56,8 +57,10 @@ from agent import (
     edit_tool_hook,
     lifecycle_hook,
     list_sessions_hook,
+    max_tokens_flag_hook,
     max_turns_flag_hook,
     model_flag_hook,
+    output_effort_hook,
     read_tool_hook,
     resume_hook,
     session_path_hook,
@@ -66,6 +69,7 @@ from agent import (
     SessionEntry,
     SessionManager,
     system_prompt_hook,
+    thinking_hook,
     ui_hook,
     write_tool_hook,
 )
@@ -77,7 +81,13 @@ from agent import (
 
 class TestMerge:
     def test_enum_members(self):
-        assert {k.name for k in Merge} == {"REPLACE", "ACCUMULATE", "BLOCK", "CHAIN"}
+        assert {k.name for k in Merge} == {
+            "REPLACE",
+            "ACCUMULATE",
+            "BLOCK",
+            "CHAIN",
+            "UPDATE",
+        }
 
     def test_identity_comparison(self):
         assert Merge.BLOCK is Merge.BLOCK
@@ -531,6 +541,95 @@ class TestChainMerge:
         assert result["system"] == "base [x] [y]"
 
 
+class TestUpdateMerge:
+    """UPDATE: each handler returns a dict; keys are shallow-merged into one
+    bucket. Later handlers overwrite earlier ones on collision."""
+
+    def test_two_handlers_contribute_disjoint_keys(self):
+        runner = HookRunner()
+        runner.api.register_event("e", Return("bag", kind=Merge.UPDATE))
+        runner.api.on("e", lambda _e, _c: {"bag": {"a": 1}})
+        runner.api.on("e", lambda _e, _c: {"bag": {"b": 2}})
+        assert runner.fire("e", {})["bag"] == {"a": 1, "b": 2}
+
+    def test_later_handler_overwrites_colliding_key(self):
+        runner = HookRunner()
+        runner.api.register_event("e", Return("bag", kind=Merge.UPDATE))
+        runner.api.on("e", lambda _e, _c: {"bag": {"a": 1}})
+        runner.api.on("e", lambda _e, _c: {"bag": {"a": 9}})
+        assert runner.fire("e", {})["bag"] == {"a": 9}
+
+    def test_handler_omitting_key_leaves_bucket_intact(self):
+        runner = HookRunner()
+        runner.api.register_event("e", Return("bag", kind=Merge.UPDATE))
+        runner.api.on("e", lambda _e, _c: {"bag": {"a": 1}})
+        runner.api.on("e", lambda _e, _c: {})
+        assert runner.fire("e", {})["bag"] == {"a": 1}
+
+    def test_empty_dict_contribution_is_noop(self):
+        runner = HookRunner()
+        runner.api.register_event("e", Return("bag", kind=Merge.UPDATE))
+        runner.api.on("e", lambda _e, _c: {"bag": {}})
+        runner.api.on("e", lambda _e, _c: {"bag": {"a": 1}})
+        assert runner.fire("e", {})["bag"] == {"a": 1}
+
+    def test_no_contributions_returns_empty_result(self):
+        runner = HookRunner()
+        runner.api.register_event("e", Return("bag", kind=Merge.UPDATE))
+        assert runner.fire("e", {}) == {}
+
+    def test_nested_dict_is_shallow_merged(self):
+        """UPDATE is a shallow merge — a colliding nested-dict key is replaced
+        wholesale, not deep-merged. This matches dict.update() semantics and
+        keeps the merge rule simple/predictable."""
+        runner = HookRunner()
+        runner.api.register_event("e", Return("bag", kind=Merge.UPDATE))
+        runner.api.on("e", lambda _e, _c: {"bag": {"nested": {"a": 1}}})
+        runner.api.on("e", lambda _e, _c: {"bag": {"nested": {"b": 2}}})
+        assert runner.fire("e", {})["bag"] == {"nested": {"b": 2}}
+
+    def test_handler_returning_none_skips_merge(self):
+        """A handler returning None short-circuits to {} — the bucket is
+        preserved from prior handlers."""
+        runner = HookRunner()
+        runner.api.register_event("e", Return("bag", kind=Merge.UPDATE))
+        runner.api.on("e", lambda _e, _c: {"bag": {"a": 1}})
+        runner.api.on("e", lambda _e, _c: None)
+        assert runner.fire("e", {})["bag"] == {"a": 1}
+
+    def test_none_value_for_key_treated_as_empty_merge(self):
+        """`{"bag": None}` is tolerated — the `or {}` guard in fire() maps it
+        to an empty update so bad handlers don't crash the whole event."""
+        runner = HookRunner()
+        runner.api.register_event("e", Return("bag", kind=Merge.UPDATE))
+        runner.api.on("e", lambda _e, _c: {"bag": {"a": 1}})
+        runner.api.on("e", lambda _e, _c: {"bag": None})
+        assert runner.fire("e", {})["bag"] == {"a": 1}
+
+    def test_three_handlers_accumulate_in_insertion_order(self):
+        """Handlers run in registration order; on key collision, the later
+        handler wins — matching CHAIN's semantics for REPLACE keys."""
+        runner = HookRunner()
+        runner.api.register_event("e", Return("bag", kind=Merge.UPDATE))
+        runner.api.on("e", lambda _e, _c: {"bag": {"x": 1, "y": 1}})
+        runner.api.on("e", lambda _e, _c: {"bag": {"y": 2, "z": 2}})
+        runner.api.on("e", lambda _e, _c: {"bag": {"z": 3}})
+        assert runner.fire("e", {})["bag"] == {"x": 1, "y": 2, "z": 3}
+
+    def test_update_coexists_with_other_merge_kinds_on_same_event(self):
+        """An event can mix UPDATE and REPLACE (and others) — each key is
+        accumulated independently according to its declared kind."""
+        runner = HookRunner()
+        runner.api.register_event(
+            "e", Return("bag", kind=Merge.UPDATE), Return("name")  # REPLACE
+        )
+        runner.api.on("e", lambda _e, _c: {"bag": {"a": 1}, "name": "first"})
+        runner.api.on("e", lambda _e, _c: {"bag": {"b": 2}, "name": "second"})
+        result = runner.fire("e", {})
+        assert result["bag"] == {"a": 1, "b": 2}  # dict-merged
+        assert result["name"] == "second"  # last-writer-wins
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Tools
 # ═══════════════════════════════════════════════════════════════════════════
@@ -569,6 +668,113 @@ class TestReadTool:
         content, err = _read_tool().execute({"path": str(tmp_path / "nope")})
         assert err is True
         assert "FileNotFoundError" in content
+
+    def test_line_numbers_padded_to_two_digit_width(self, tmp_path):
+        """With 12 lines, width=2 so single-digit numbers are space-padded
+        for column alignment (' 1\\tx' not '1\\tx')."""
+        f = tmp_path / "a.txt"
+        f.write_text("\n".join("x" for _ in range(12)))
+        content, _ = _read_tool().execute({"path": str(f)})
+        lines = content.splitlines()
+        assert lines[0] == " 1\tx"
+        assert lines[-1] == "12\tx"
+
+    def test_line_numbers_padded_to_three_digit_width(self, tmp_path):
+        f = tmp_path / "a.txt"
+        f.write_text("\n".join("y" for _ in range(100)))
+        content, _ = _read_tool().execute({"path": str(f)})
+        lines = content.splitlines()
+        assert lines[0] == "  1\ty"
+        assert lines[99] == "100\ty"
+
+    def test_width_follows_highest_shown_line_not_file_total(self, tmp_path):
+        """Width is computed from `offset + len(chunk)` — the largest number
+        *actually shown in the page*, not the total file size."""
+        f = tmp_path / "a.txt"
+        f.write_text("\n".join("z" for _ in range(200)))
+        # Show lines 1..5 — width should be 1 (max shown = 5), not 3.
+        content, _ = _read_tool().execute({"path": str(f), "offset": 0, "limit": 5})
+        assert content.startswith("1\tz\n2\tz\n3\tz\n4\tz\n5\tz")
+
+    def test_remaining_count_reflects_unread_lines(self, tmp_path):
+        f = tmp_path / "a.txt"
+        f.write_text("\n".join(str(i) for i in range(1, 101)))
+        content, _ = _read_tool().execute({"path": str(f), "offset": 0, "limit": 10})
+        assert "(90 more lines; pass offset=10 to continue)" in content
+
+    def test_offset_past_end_reports_empty(self, tmp_path):
+        f = tmp_path / "a.txt"
+        f.write_text("a\nb\nc")
+        content, err = _read_tool().execute({"path": str(f), "offset": 999})
+        assert err is False
+        assert content == "(empty)"
+
+    def test_negative_offset_clamps_to_zero(self, tmp_path):
+        f = tmp_path / "a.txt"
+        f.write_text("a\nb\nc")
+        content, err = _read_tool().execute({"path": str(f), "offset": -5, "limit": 2})
+        assert err is False
+        assert content.startswith("1\ta\n2\tb")
+
+    def test_zero_limit_clamps_to_one_line(self, tmp_path):
+        """limit<1 would otherwise produce an empty chunk — the tool clamps
+        to 1 so the model always sees at least one line of content."""
+        f = tmp_path / "a.txt"
+        f.write_text("a\nb\nc")
+        content, err = _read_tool().execute({"path": str(f), "limit": 0})
+        assert err is False
+        assert content.startswith("1\ta")
+
+    def test_default_limit_is_500(self, tmp_path):
+        """Default read caps at 500 lines — lower than the 2000 previously used.
+        Keeps context reads from monopolizing the model's attention."""
+        f = tmp_path / "big.txt"
+        f.write_text("\n".join(f"line {i}" for i in range(1, 601)))
+        content, err = _read_tool().execute({"path": str(f)})
+        assert err is False
+        # 500 lines shown, 100 more with continuation hint.
+        assert content.count("\n") == 500  # 500 numbered lines + trailing hint line
+        assert "100 more lines" in content
+        assert "offset=500" in content
+
+    def test_byte_cap_triggers_on_dense_lines(self, tmp_path):
+        """The 50KB byte cap kicks in before the 500-line cap when lines are
+        dense. Lines stop at a whole-line boundary; the remaining-line count
+        and next-offset hint reflect where the cap landed."""
+        # 200 lines × 400 bytes = 80KB. Byte cap (50KB) hits first.
+        f = tmp_path / "dense.txt"
+        line = "x" * 400
+        f.write_text("\n".join(line for _ in range(200)))
+        content, err = _read_tool().execute({"path": str(f)})
+        assert err is False
+        # 50 * 1024 = 51200. First line = 400, each subsequent = 401 (with \n).
+        # 400 + (k-1)*401 ≤ 51200 → k ≤ 127.68 → k = 127.
+        lines_shown = content.split("\n... ")[0].count("\n") + 1
+        assert lines_shown == 127
+        assert "73 more lines" in content
+        assert "offset=127" in content
+
+    def test_byte_cap_first_line_exceeds_limit(self, tmp_path):
+        """When a single line is > 50KB, nothing fits. Emit an actionable
+        hint pointing at `bash sed` as a fallback, rather than silently
+        returning empty — the model needs to know why it got no content."""
+        f = tmp_path / "huge.txt"
+        f.write_text("Z" * (60 * 1024))  # single 60KB line
+        content, err = _read_tool().execute({"path": str(f)})
+        assert err is False
+        assert "exceeds the 50KB byte cap" in content
+        assert "sed -n '1p'" in content
+
+    def test_byte_cap_respects_offset(self, tmp_path):
+        """Byte cap applies to the chunk starting at `offset`, not the whole
+        file — seeking past a giant line must still work."""
+        f = tmp_path / "mixed.txt"
+        # line 1: 60KB (over cap); lines 2+: tiny.
+        f.write_text("Z" * (60 * 1024) + "\n" + "\n".join(f"line{i}" for i in range(5)))
+        content, err = _read_tool().execute({"path": str(f), "offset": 1})
+        assert err is False
+        assert "line0" in content
+        assert "line4" in content
 
 
 class TestWriteTool:
@@ -1679,6 +1885,371 @@ class TestMaxTurnsFlag:
         assert result == {"max_turns": 50}
 
 
+class TestStreamExtraFlags:
+    """The three --max-tokens / --think / --effort hooks share a common
+    shape (capture args, inject into before_model_request). Test each
+    hook's contract: default, override, and that args_parsed must fire
+    before before_model_request (otherwise the hook is silent rather
+    than crashing)."""
+
+    def _loaded(self, hook):
+        runner = HookRunner()
+        runner.load(hook)
+        return runner
+
+    def _fire(self, runner, argv):
+        args = runner.parser.parse_args(argv)
+        runner.fire("args_parsed", {"args": args})
+        return runner.fire(
+            "before_model_request",
+            {"system": "", "tools": [], "messages": []},
+        )
+
+    def test_max_tokens_default_is_64000(self):
+        result = self._fire(self._loaded(max_tokens_flag_hook), [])
+        assert result["extra"] == {"max_tokens": 64000}
+
+    def test_max_tokens_override(self):
+        result = self._fire(
+            self._loaded(max_tokens_flag_hook), ["--max-tokens", "64000"]
+        )
+        assert result["extra"] == {"max_tokens": 64000}
+
+    def test_thinking_default_is_adaptive_summarized(self):
+        result = self._fire(self._loaded(thinking_hook), [])
+        assert result["extra"] == {
+            "thinking": {"type": "adaptive", "display": "summarized"}
+        }
+
+    def test_thinking_display_overrides_summarized_default(self):
+        result = self._fire(
+            self._loaded(thinking_hook),
+            ["--thinking-display", "raw"],
+        )
+        assert result["extra"] == {"thinking": {"type": "adaptive", "display": "raw"}}
+
+    def test_effort_default_is_xhigh(self):
+        result = self._fire(self._loaded(output_effort_hook), [])
+        assert result["extra"] == {"output_config": {"effort": "xhigh"}}
+
+    def test_effort_override(self):
+        result = self._fire(self._loaded(output_effort_hook), ["--effort", "medium"])
+        assert result["extra"] == {"output_config": {"effort": "medium"}}
+
+    def test_effort_rejects_invalid_level(self):
+        runner = self._loaded(output_effort_hook)
+        with pytest.raises(SystemExit):
+            runner.parser.parse_args(["--effort", "turbo"])
+
+    def test_before_model_request_without_args_parsed_is_silent(self):
+        """If a harness fires before_model_request without ever firing
+        args_parsed, the hook must not explode — it contributes nothing."""
+        runner = self._loaded(thinking_hook)
+        result = runner.fire(
+            "before_model_request",
+            {"system": "", "tools": [], "messages": []},
+        )
+        assert "extra" not in result
+
+    def test_three_hooks_merge_into_single_extra_bucket(self):
+        """Loaded together, the three hooks cohabit one `extra` dict via
+        Merge.UPDATE — the defining integration check."""
+        runner = HookRunner()
+        for h in (max_tokens_flag_hook, thinking_hook, output_effort_hook):
+            runner.load(h)
+        args = runner.parser.parse_args(
+            ["--max-tokens", "64000", "--thinking-display", "raw", "--effort", "xhigh"]
+        )
+        runner.fire("args_parsed", {"args": args})
+        result = runner.fire(
+            "before_model_request",
+            {"system": "", "tools": [], "messages": []},
+        )
+        assert result["extra"] == {
+            "max_tokens": 64000,
+            "thinking": {"type": "adaptive", "display": "raw"},
+            "output_config": {"effort": "xhigh"},
+        }
+
+    def test_three_hooks_with_no_flags_still_carry_defaults(self):
+        """All three hooks have meaningful defaults: max_tokens=64000,
+        thinking=adaptive/summarized, effort=xhigh. Running with no flags
+        yields the full Claude Code-shaped payload."""
+        runner = HookRunner()
+        for h in (max_tokens_flag_hook, thinking_hook, output_effort_hook):
+            runner.load(h)
+        args = runner.parser.parse_args([])
+        runner.fire("args_parsed", {"args": args})
+        result = runner.fire(
+            "before_model_request",
+            {"system": "", "tools": [], "messages": []},
+        )
+        assert result["extra"] == {
+            "max_tokens": 64000,
+            "thinking": {"type": "adaptive", "display": "summarized"},
+            "output_config": {"effort": "xhigh"},
+        }
+
+
+class TestStreamExtraHookHelper:
+    """The shared `_stream_extra_hook` helper underlies the three feature
+    hooks. Its contract: capture args on args_parsed, call build(args) at
+    before_model_request, inject into `extra` only if build returns a
+    truthy dict. These tests exercise the helper directly (not via its
+    users) so a regression in the helper is localized."""
+
+    def _fire(self, runner, argv):
+        args = runner.parser.parse_args(argv)
+        runner.fire("args_parsed", {"args": args})
+        return runner.fire(
+            "before_model_request",
+            {"system": "", "tools": [], "messages": []},
+        )
+
+    def test_build_returning_none_injects_nothing(self):
+        runner = HookRunner()
+        _stream_extra_hook(runner.api, lambda a: None, "--x", default="v")
+        result = self._fire(runner, [])
+        assert "extra" not in result
+
+    def test_build_returning_empty_dict_injects_nothing(self):
+        runner = HookRunner()
+        _stream_extra_hook(runner.api, lambda a: {}, "--x", default="v")
+        result = self._fire(runner, [])
+        assert "extra" not in result
+
+    def test_build_returning_truthy_dict_lands_in_extra(self):
+        runner = HookRunner()
+        _stream_extra_hook(runner.api, lambda a: {"k": a.x}, "--x", default="hi")
+        result = self._fire(runner, [])
+        assert result["extra"] == {"k": "hi"}
+
+    def test_build_sees_argparse_namespace_with_parsed_flag(self):
+        """Sanity: the helper wires argparse to build() — a value passed on
+        the CLI arrives in args.x (dashes in the flag become underscores)."""
+        runner = HookRunner()
+        captured: list = []
+        _stream_extra_hook(
+            runner.api,
+            lambda a: captured.append(a.my_flag) or {"k": a.my_flag},
+            "--my-flag",
+            default="default",
+        )
+        self._fire(runner, ["--my-flag", "override"])
+        assert captured == ["override"]
+
+    def test_before_model_request_without_args_parsed_is_silent(self):
+        """If the harness fires before_model_request without args_parsed
+        having run, build() must not be invoked — prevents AttributeError
+        on an empty Namespace."""
+        runner = HookRunner()
+        calls: list = []
+        _stream_extra_hook(
+            runner.api,
+            lambda a: calls.append(a) or {"k": 1},
+            "--x",
+            default="v",
+        )
+        result = runner.fire(
+            "before_model_request",
+            {"system": "", "tools": [], "messages": []},
+        )
+        assert calls == []
+        assert "extra" not in result
+
+    def test_two_helpers_coexist_without_flag_collision(self):
+        """Two independent calls register distinct flags and both inject."""
+        runner = HookRunner()
+        _stream_extra_hook(runner.api, lambda a: {"a": a.one}, "--one", default=1)
+        _stream_extra_hook(runner.api, lambda a: {"b": a.two}, "--two", default=2)
+        result = self._fire(runner, [])
+        assert result["extra"] == {"a": 1, "b": 2}
+
+
+class _FakeUsage:
+    def model_dump(self):
+        return {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+        }
+
+
+class _FakeMessage:
+    content: list = []
+    stop_reason = "end_turn"
+    usage = _FakeUsage()
+
+    def model_dump(self, mode="json"):
+        return {"content": []}
+
+
+class _FakeStream:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        return None
+
+    @property
+    def text_stream(self):
+        async def _gen():
+            return
+            yield ""  # pragma: no cover  — unreachable; satisfies async-gen contract
+
+        return _gen()
+
+    async def get_final_message(self):
+        return _FakeMessage()
+
+
+def _fake_client(captured_kwargs: list[dict]) -> object:
+    """Returns a minimal Anthropic-shaped client. `captured_kwargs` is a
+    list the client appends each `messages.stream(**kwargs)` call into,
+    so tests can assert on the exact kwargs that would hit the wire."""
+
+    class FakeMessages:
+        def stream(self, **kwargs):
+            captured_kwargs.append(kwargs)
+            return _FakeStream()
+
+    class FakeClient:
+        messages = FakeMessages()
+
+    return FakeClient()
+
+
+class TestAgentLoopStreamKwargs:
+    """End-to-end wiring: hook contributions to `extra` must land as kwargs
+    on client.messages.stream(). Without this layer of check, future
+    refactors can silently drop fields between the hook and the HTTP call
+    (the tests above cover the hook layer in isolation; these tests cover
+    the plumbing that connects hook → stream)."""
+
+    def _run_turn(self, tmp_path, runner, argv) -> dict:
+        import asyncio
+
+        import agent as agent_mod
+
+        args = runner.parser.parse_args(argv)
+        runner.fire("args_parsed", {"args": args})
+        sm = SessionManager(tmp_path / "s.jsonl")
+        sm.append("user", "hi")
+        captured: list[dict] = []
+        asyncio.run(
+            agent_mod.agent_loop(
+                _fake_client(captured),
+                "test-model",
+                str(tmp_path),
+                [],
+                sm,
+                runner,
+                [],
+                max_turns=1,
+            )
+        )
+        assert len(captured) == 1, "exactly one stream() call expected"
+        return captured[0]
+
+    def test_max_tokens_default_lands_on_stream(self, tmp_path):
+        runner = HookRunner()
+        runner.load(max_tokens_flag_hook)
+        assert self._run_turn(tmp_path, runner, [])["max_tokens"] == 64000
+
+    def test_max_tokens_override_lands_on_stream(self, tmp_path):
+        runner = HookRunner()
+        runner.load(max_tokens_flag_hook)
+        kwargs = self._run_turn(tmp_path, runner, ["--max-tokens", "8192"])
+        assert kwargs["max_tokens"] == 8192
+
+    def test_thinking_default_lands_on_stream(self, tmp_path):
+        runner = HookRunner()
+        runner.load(thinking_hook)
+        kwargs = self._run_turn(tmp_path, runner, [])
+        assert kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
+
+    def test_thinking_display_override_lands_on_stream(self, tmp_path):
+        runner = HookRunner()
+        runner.load(thinking_hook)
+        kwargs = self._run_turn(tmp_path, runner, ["--thinking-display", "raw"])
+        assert kwargs["thinking"] == {"type": "adaptive", "display": "raw"}
+
+    def test_output_config_default_lands_on_stream(self, tmp_path):
+        runner = HookRunner()
+        runner.load(output_effort_hook)
+        kwargs = self._run_turn(tmp_path, runner, [])
+        assert kwargs["output_config"] == {"effort": "xhigh"}
+
+    def test_output_effort_override_lands_on_stream(self, tmp_path):
+        runner = HookRunner()
+        runner.load(output_effort_hook)
+        kwargs = self._run_turn(tmp_path, runner, ["--effort", "medium"])
+        assert kwargs["output_config"] == {"effort": "medium"}
+
+    def test_all_three_hooks_land_together(self, tmp_path):
+        runner = HookRunner()
+        for h in (max_tokens_flag_hook, thinking_hook, output_effort_hook):
+            runner.load(h)
+        kwargs = self._run_turn(
+            tmp_path,
+            runner,
+            [
+                "--max-tokens",
+                "12345",
+                "--thinking-display",
+                "raw",
+                "--effort",
+                "high",
+            ],
+        )
+        assert kwargs["max_tokens"] == 12345
+        assert kwargs["thinking"] == {"type": "adaptive", "display": "raw"}
+        assert kwargs["output_config"] == {"effort": "high"}
+
+    def test_max_tokens_not_duplicated_in_stream_call(self, tmp_path):
+        """max_tokens is popped out of extras before the dict-splat, so it
+        only appears once in the stream kwargs. If the pop were forgotten,
+        Python would raise TypeError (multiple values for keyword argument)
+        and the test below would fail. The completion of the run IS the
+        assertion — getting here at all means no collision."""
+        runner = HookRunner()
+        runner.load(max_tokens_flag_hook)
+        kwargs = self._run_turn(tmp_path, runner, [])
+        # Redundant but explicit: the key lives at top level, not in nested extras.
+        assert "max_tokens" in kwargs
+        assert isinstance(kwargs["max_tokens"], int)
+
+    def test_fallback_max_tokens_when_no_hook_loaded(self, tmp_path):
+        """Without max_tokens_flag_hook loaded, agent_loop's hardcoded
+        fallback (64000) still reaches the stream. This matches the hook's
+        default, so behavior is consistent whether or not the hook is wired."""
+        runner = HookRunner()  # no feature hooks
+        kwargs = self._run_turn(tmp_path, runner, [])
+        assert kwargs["max_tokens"] == 64000
+
+    def test_core_kwargs_preserved_alongside_extras(self, tmp_path):
+        """The core stream kwargs (model, system, tools, messages) must
+        survive the **extras splat — if extras accidentally clobbered any
+        of them, the request would be malformed."""
+        runner = HookRunner()
+        runner.load(output_effort_hook)
+        kwargs = self._run_turn(tmp_path, runner, [])
+        assert kwargs["model"] == "test-model"
+        assert "system" in kwargs
+        assert "tools" in kwargs
+        assert "messages" in kwargs
+        assert kwargs["messages"] == [{"role": "user", "content": "hi"}]
+        assert kwargs["output_config"] == {"effort": "xhigh"}
+
+    def test_no_hooks_yields_minimal_stream_kwargs(self, tmp_path):
+        """With a bare runner, stream() sees model + max_tokens + system +
+        tools + messages — the irreducible minimum — and no extras."""
+        runner = HookRunner()
+        kwargs = self._run_turn(tmp_path, runner, [])
+        assert set(kwargs) == {"model", "max_tokens", "system", "tools", "messages"}
+
+
 class TestStrictHooksFlag:
     """--strict-hooks carries behavior in addition to a flag value: an
     args_parsed handler copies it into runner.strict. Each step has its
@@ -1813,14 +2384,16 @@ class TestFuzzTools:
         # \r is excluded because Python's text-mode read translates \r and
         # \r\n to \n (universal newlines). That's a read_text quirk, not an
         # agent bug — write_text + read_text both use text mode by default.
-        # read now adds "<n>\t" line-number prefixes; strip them to recover
-        # the lines. splitlines() drops the trailing newline, so we compare
-        # against content.splitlines() rather than content itself.
+        # read adds "<n>\t" line-number prefixes; strip them to recover the
+        # lines. splitlines() drops the trailing newline, so we compare
+        # against content.splitlines(). We pass an explicit high `limit` to
+        # disable the default 500-line cap for this round-trip check — the
+        # cap is a feature for real reads, but would break the invariant here.
         with tempfile.TemporaryDirectory() as d:
             f = Path(d) / "rt.txt"
             _, wr_err = _write_tool().execute({"path": str(f), "content": content})
             assert wr_err is False
-            out, rd_err = _read_tool().execute({"path": str(f)})
+            out, rd_err = _read_tool().execute({"path": str(f), "limit": 10000})
             assert rd_err is False
             if not content:
                 assert out == "(empty)"
