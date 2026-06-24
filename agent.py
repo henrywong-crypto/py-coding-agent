@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.10"
+# requires-python = ">=3.11"
 # dependencies = ["anthropic", "rich", "prompt_toolkit"]
 # ///
 """
@@ -18,6 +18,12 @@ and wires its contributions into the runner. Through `HookAPI` a hook
 can attach handlers to named events, register tools, add CLI flags,
 or provide the prompter and history loader.
 
+Built-in hooks live in this file's `HOOKS` tuple. Further hooks can be
+dropped into sibling `.py` files in this directory: any file exposing a
+module-level `HOOKS` tuple is auto-loaded at startup (see `load_extensions`),
+importing what it needs from `agent`. `python.py` and `rust.py` are such
+extensions — delete one and that language support is simply gone.
+
 When an event fires it carries a typed `Payload` dataclass. Handlers
 receive the payload and mutate it in place, in priority order (lower
 first, insertion order on ties). Any handler can stop the chain for
@@ -29,17 +35,19 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import importlib.util
+import inspect
 import json
 import os
 import re
-import subprocess
+import shutil
 import sys
 import traceback
 import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 from anthropic import AsyncAnthropic
 from rich.markup import escape
@@ -79,7 +87,7 @@ class SessionPath(Payload):
 class SessionConfig(Payload):
     args: argparse.Namespace
     model: str | None = None
-    max_turns: int = 25
+    max_turns: int = 50
     client: Any = None
 
 
@@ -236,20 +244,24 @@ class HookRunner:
     def parse_args(self) -> argparse.Namespace:
         return self.parser.parse_args()
 
-    def fire(
+    async def fire(
         self, event: str, payload: Payload | None = None, ctx: dict | None = None
     ) -> Payload | None:
         """Run every handler registered on `event`, in priority order (lower first,
-        insertion order on ties). Handlers mutate `payload`. If a handler sets
-        `payload.blocked = True`, later handlers are skipped. Returns `payload`
-        so callers can destructure directly."""
+        insertion order on ties). Handlers mutate `payload`. A handler may be a
+        plain function or a coroutine function — if it returns an awaitable, it is
+        awaited before the next runs. If a handler sets `payload.blocked = True`,
+        later handlers are skipped. Returns `payload` so callers can destructure
+        directly."""
         if event not in self.events:
             raise ValueError(f"unknown event {event!r}")
         ctx = ctx or {}
         ordered = sorted(self.handlers[event], key=lambda h: h.priority)
         for h in ordered:
             try:
-                h.fn(payload, ctx)
+                result = h.fn(payload, ctx)
+                if inspect.isawaitable(result):
+                    await result
             except Exception:
                 if self.strict:
                     raise
@@ -277,7 +289,7 @@ class Tool:
     name: str
     description: str
     schema: dict
-    execute: Callable[[dict], tuple[str, bool]]
+    execute: Callable[[dict], tuple[str, bool] | Awaitable[tuple[str, bool]]]
     # Optional co-located display. Both receive a per-call `state` dict
     # that carries data from call → result and is visible to other hooks.
     render_call: Callable[["Tool", dict, Any, dict], None] | None = None
@@ -294,7 +306,21 @@ class Tool:
 def _tool_fn(
     fn: Callable[[dict], tuple[str, bool]],
 ) -> Callable[[dict], tuple[str, bool]]:
-    """Wrap a tool body so unexpected exceptions become `(error_text, True)`."""
+    """Wrap a tool body so unexpected exceptions become `(error_text, True)`.
+
+    Handles sync and `async def` bodies alike: an async body is awaited inside
+    the same guard, so an exception raised while it runs is caught too — not
+    just one raised before it returns the coroutine."""
+
+    if inspect.iscoroutinefunction(fn):
+
+        async def aexecute(args: dict) -> tuple[str, bool]:
+            try:
+                return await fn(args)
+            except Exception as e:
+                return f"{type(e).__name__}: {e}", True
+
+        return aexecute
 
     def execute(args: dict) -> tuple[str, bool]:
         try:
@@ -303,6 +329,16 @@ def _tool_fn(
             return f"{type(e).__name__}: {e}", True
 
     return execute
+
+
+async def _maybe_await(value: Any) -> Any:
+    """Await `value` if it's awaitable, else return it as-is.
+
+    Lets the runtime treat sync and async tool/hook bodies uniformly: a tool's
+    `execute` may be a plain function or a coroutine function, and callers
+    `await _maybe_await(tool.execute(args))` either way.
+    """
+    return await value if inspect.isawaitable(value) else value
 
 
 def _read_tool() -> Tool:
@@ -369,12 +405,19 @@ def _read_tool() -> Tool:
 def _write_tool() -> Tool:
     @_tool_fn
     def execute(args: dict) -> tuple[str, bool]:
-        Path(args["path"]).write_text(args["content"])
+        path = Path(args["path"])
+        # Create missing parent directories so writing into a new directory
+        # tree succeeds instead of raising FileNotFoundError.
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(args["content"])
         return f"wrote {len(args['content'])} bytes to {args['path']}", False
 
     return Tool(
         name="write",
-        description="Overwrite a file with the given content. Creates it if missing.",
+        description=(
+            "Overwrite a file with the given content. Creates the file and any "
+            "missing parent directories."
+        ),
         schema={
             "type": "object",
             "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
@@ -448,25 +491,449 @@ def _edit_tool() -> Tool:
 
 def _bash_tool() -> Tool:
     @_tool_fn
-    def execute(args: dict) -> tuple[str, bool]:
+    async def execute(args: dict) -> tuple[str, bool]:
+        # No default timeout: a `grep`/`find` over a large tree should run to
+        # completion, not die at an arbitrary 60s cutoff. The model bounds a
+        # command it expects to hang or run away by passing `timeout` (seconds).
+        # stdin is closed (DEVNULL) so a command that would block on input
+        # gets EOF and fails fast instead of hanging the agent forever.
+        timeout = args.get("timeout") or None
+        proc = await asyncio.create_subprocess_shell(
+            args["cmd"],
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
         try:
-            r = subprocess.run(
-                args["cmd"], shell=True, capture_output=True, text=True, timeout=60
-            )
-        except subprocess.TimeoutExpired:
-            return "bash timed out after 60s", True
-        return (r.stdout + r.stderr)[:20_000] or "(no output)", r.returncode != 0
+            out, err = await asyncio.wait_for(proc.communicate(), timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return f"bash timed out after {timeout}s", True
+        text = out.decode(errors="replace") + err.decode(errors="replace")
+        return text[:20_000] or "(no output)", proc.returncode != 0
 
     return Tool(
         name="bash",
-        description="Run a shell command. Returns combined stdout+stderr.",
+        description=(
+            "Run a shell command. Returns combined stdout+stderr (capped at "
+            "20KB). Runs with stdin closed. No timeout by default; pass "
+            "`timeout` (seconds) to bound a command that might hang or run away."
+        ),
         schema={
             "type": "object",
-            "properties": {"cmd": {"type": "string"}},
+            "properties": {
+                "cmd": {"type": "string"},
+                "timeout": {"type": "number", "minimum": 0},
+            },
             "required": ["cmd"],
         },
         execute=execute,
     )
+
+
+@dataclass(frozen=True)
+class LspServer:
+    """Spec for a language server: how to spawn it and which language it owns."""
+
+    cmd: tuple[str, ...]
+    language_id: str  # tool suffix + LSP languageId (e.g. "python", "rust")
+
+
+class LspClient:
+    """Minimal JSON-RPC client speaking LSP over a server's stdio.
+
+    A reader task pumps framed messages off the server's stdout: responses
+    resolve the future their request id is waiting on; pushed
+    `publishDiagnostics` notifications update `_diagnostics` and wake any
+    waiter; server-bound requests are acked with null so the server keeps
+    making progress. Because each call awaits its own future, concurrent calls
+    on one client are safe with no lock — that's what lets a turn's tool calls
+    run in parallel.
+    """
+
+    def __init__(self, server: LspServer, root: Path) -> None:
+        self.server = server
+        self.root = root
+        self._proc: asyncio.subprocess.Process | None = None
+        self._reader_task: asyncio.Task | None = None
+        self._next_id = 0
+        self._pending: dict[int, asyncio.Future] = {}  # request id -> result future
+        self._opened: dict[Path, tuple[int, str]] = {}  # path -> (version, last_text)
+        self._diagnostics: dict[str, list[dict]] = {}
+        self._diag_event = asyncio.Event()  # set on every publishDiagnostics
+
+    # --- transport ------------------------------------------------------
+
+    async def _start(self) -> None:
+        if self._proc is not None:
+            return
+        self._proc = await asyncio.create_subprocess_exec(
+            *self.server.cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            limit=2**21,  # roomy line/frame buffer for big hover/definition bodies
+        )
+        self._reader_task = asyncio.create_task(self._reader())
+        await self._request(
+            "initialize",
+            {
+                "processId": os.getpid(),
+                "rootUri": self.root.as_uri(),
+                "capabilities": {},
+            },
+        )
+        await self._notify("initialized", {})
+
+    async def _reader(self) -> None:
+        out = self._proc.stdout if self._proc else None
+        if out is None:
+            return
+        try:
+            while True:
+                length = 0
+                while True:
+                    line = await out.readline()
+                    if not line:
+                        return
+                    if line in (b"\r\n", b"\n"):
+                        break
+                    if line.lower().startswith(b"content-length:"):
+                        length = int(line.split(b":", 1)[1].strip())
+                body = await out.readexactly(length)
+                await self._dispatch(json.loads(body))
+        except (asyncio.IncompleteReadError, asyncio.CancelledError):
+            return
+        except Exception as e:
+            print(
+                f"[lsp/{self.server.language_id}] reader exited: {e}",
+                file=sys.stderr,
+            )
+
+    async def _dispatch(self, msg: dict) -> None:
+        if msg.get("method") == "textDocument/publishDiagnostics":
+            p = msg.get("params") or {}
+            self._diagnostics[p.get("uri", "")] = p.get("diagnostics") or []
+            self._diag_event.set()
+        elif "id" in msg and "method" not in msg:  # response to one of our requests
+            fut = self._pending.pop(msg["id"], None)
+            if fut is not None and not fut.done():
+                fut.set_result(msg.get("result"))
+        elif "id" in msg and "method" in msg:  # server -> client request: ack null
+            await self._notify(None, None, _id=msg["id"])
+
+    async def _send(self, msg: dict) -> None:
+        body = json.dumps(msg).encode()
+        assert self._proc and self._proc.stdin
+        self._proc.stdin.write(f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+        await self._proc.stdin.drain()
+
+    async def _request(self, method: str, params: dict, timeout: float = 10.0) -> Any:
+        self._next_id += 1
+        rid = self._next_id
+        fut = asyncio.get_running_loop().create_future()
+        self._pending[rid] = fut
+        await self._send(
+            {"jsonrpc": "2.0", "id": rid, "method": method, "params": params}
+        )
+        try:
+            return await asyncio.wait_for(fut, timeout)
+        except asyncio.TimeoutError:
+            self._pending.pop(rid, None)
+            return None
+
+    async def _notify(self, method: str | None, params: dict | None, _id=None) -> None:
+        msg: dict = {"jsonrpc": "2.0"}
+        if _id is not None:  # null ack to a server-bound request
+            msg["id"], msg["result"] = _id, None
+        else:
+            msg["method"], msg["params"] = method, params
+        await self._send(msg)
+
+    # --- LSP surface ----------------------------------------------------
+
+    async def open(self, path: Path) -> None:
+        """Open `path` on first call; on later calls, send didChange when the
+        on-disk content has changed since we last told the server about it.
+
+        Without the change-detection step, edits made between LSP calls are
+        invisible to the server — diagnostics, hover, etc. keep reporting on
+        the original buffer.
+        """
+        await self._start()
+        text = path.read_text()
+        state = self._opened.get(path)
+        if state is None:
+            self._opened[path] = (1, text)
+            await self._notify(
+                "textDocument/didOpen",
+                {
+                    "textDocument": {
+                        "uri": path.as_uri(),
+                        "languageId": self.server.language_id,
+                        "version": 1,
+                        "text": text,
+                    }
+                },
+            )
+            return
+        if state[1] == text:
+            return
+        version = state[0] + 1
+        self._opened[path] = (version, text)
+        self._diagnostics.pop(path.as_uri(), None)  # stale; the server will republish
+        await self._notify(
+            "textDocument/didChange",
+            {
+                "textDocument": {"uri": path.as_uri(), "version": version},
+                "contentChanges": [{"text": text}],
+            },
+        )
+
+    async def _at(
+        self, method: str, path: Path, line: int, col: int, **extra: Any
+    ) -> Any:
+        await self.open(path)
+        return await self._request(
+            method,
+            {
+                "textDocument": {"uri": path.as_uri()},
+                "position": {"line": line, "character": col},
+                **extra,
+            },
+        )
+
+    async def hover(self, path: Path, line: int, col: int) -> Any:
+        return await self._at("textDocument/hover", path, line, col)
+
+    async def definition(self, path: Path, line: int, col: int) -> Any:
+        return await self._at("textDocument/definition", path, line, col)
+
+    async def references(self, path: Path, line: int, col: int) -> Any:
+        return await self._at(
+            "textDocument/references",
+            path,
+            line,
+            col,
+            context={"includeDeclaration": False},
+        )
+
+    async def diagnostics(
+        self, path: Path, wait: float = 5.0, settle: float = 0.3
+    ) -> list[dict]:
+        """Open/refresh `path`, then block until the server publishes
+        diagnostics for it — returning once they settle, or after `wait`
+        seconds.
+
+        The wait is the whole game on a cold server: pyright and especially
+        rust-analyzer publish nothing until their first analysis pass
+        finishes, so a short fixed sleep returns `[]` — indistinguishable
+        from a clean file — and the tool looks broken. Waiting for the first
+        publish for this URI fixes that without slowing down a warm server.
+
+        But the first publish isn't the last word: rust-analyzer emits an
+        empty set the instant it opens a file, then the real diagnostics
+        back-to-back once analysis lands. Returning on the first publish would
+        hand back that placeholder. So after the first publish we keep waiting
+        for follow-ups until `settle` seconds of quiet — bounded by the same
+        `wait` deadline — and return the latest set.
+        """
+        uri = path.as_uri()
+        await self.open(path)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + wait
+
+        async def wait_event(timeout: float) -> bool:
+            """Wait for the next publish; True if one arrived, False on timeout.
+            `_diagnostics` is updated before the event fires, so the caller's
+            condition check after a True is authoritative."""
+            self._diag_event.clear()
+            try:
+                await asyncio.wait_for(self._diag_event.wait(), timeout)
+                return True
+            except asyncio.TimeoutError:
+                return False
+
+        while uri not in self._diagnostics and (left := deadline - loop.time()) > 0:
+            if not await wait_event(left):
+                break
+        while uri in self._diagnostics and (left := deadline - loop.time()) > 0:
+            if not await wait_event(min(settle, left)):
+                break  # quiet for `settle` — the server has stopped revising
+        return self._diagnostics.get(uri, [])
+
+    async def shutdown(self) -> None:
+        if self._proc is None:
+            return
+        try:
+            await self._request("shutdown", {}, timeout=2.0)
+            await self._notify("exit", {})
+        except Exception:
+            pass
+        if self._reader_task is not None:
+            self._reader_task.cancel()
+        try:
+            self._proc.terminate()
+        except Exception:
+            pass
+
+
+def _fmt_hover(result: Any) -> str:
+    if not result:
+        return "(no hover info)"
+    contents = result.get("contents")
+    if isinstance(contents, str):
+        return contents
+    if isinstance(contents, dict):
+        return contents.get("value") or ""
+    if isinstance(contents, list):
+        parts = [
+            c if isinstance(c, str) else (c or {}).get("value", "") for c in contents
+        ]
+        return "\n\n".join(p for p in parts if p)
+    return str(contents)
+
+
+def _fmt_locations(result: Any) -> str:
+    if not result:
+        return "(no locations)"
+    locs = result if isinstance(result, list) else [result]
+    out: list[str] = []
+    for loc in locs:
+        uri = loc.get("uri") or loc.get("targetUri") or ""
+        rng = loc.get("range") or loc.get("targetSelectionRange") or {}
+        start = rng.get("start") or {}
+        path = uri.removeprefix("file://")
+        out.append(f"{path}:{start.get('line', 0) + 1}:{start.get('character', 0) + 1}")
+    return "\n".join(out) or "(no locations)"
+
+
+_LSP_SEVERITY = {1: "error", 2: "warn", 3: "info", 4: "hint"}
+
+
+def _fmt_diagnostics(diags: list[dict]) -> str:
+    if not diags:
+        return "(no diagnostics)"
+    lines = []
+    for d in diags:
+        start = (d.get("range") or {}).get("start") or {}
+        sev = _LSP_SEVERITY.get(d.get("severity") or 0, "info")
+        msg = d.get("message", "").replace("\n", " ")
+        lines.append(f"{sev}\tline {start.get('line', 0) + 1}\t{msg}")
+    return "\n".join(lines)
+
+
+def _resolve_symbol(
+    text: str, symbol: str, line_hint: int | None
+) -> tuple[int, int] | None:
+    """0-based (line, col) of the first word-boundary match of `symbol`.
+
+    If `line_hint` (1-based) is given, search that line first, then fall back
+    to a top-to-bottom scan. Identifiers match on a word boundary so `add`
+    doesn't hit inside `address`; anything else (e.g. `foo.bar`) matches
+    literally. Returns None when the symbol isn't found.
+    """
+    lines = text.splitlines()
+    pat = re.compile(rf"\b{re.escape(symbol)}\b") if symbol.isidentifier() else None
+
+    def find(i: int) -> tuple[int, int] | None:
+        if not (0 <= i < len(lines)):
+            return None
+        if pat is not None:
+            m = pat.search(lines[i])
+            col = m.start() if m else -1
+        else:
+            col = lines[i].find(symbol)
+        return (i, col) if col >= 0 else None
+
+    if line_hint and (hit := find(line_hint - 1)):
+        return hit
+    for i in range(len(lines)):
+        if hit := find(i):
+            return hit
+    return None
+
+
+def _lsp_tool(server: LspServer, client: LspClient) -> Tool:
+    @_tool_fn
+    async def execute(args: dict) -> tuple[str, bool]:
+        path = Path(args["path"]).resolve()
+        op = args["operation"]
+        if op == "diagnostics":
+            return (
+                _fmt_diagnostics(
+                    await client.diagnostics(path, wait=float(args.get("wait", 5.0)))
+                ),
+                False,
+            )
+        if op not in ("hover", "definition", "references"):
+            return f"unknown operation: {op}", True
+        if "line" in args and "character" in args:  # precise position
+            line = int(args["line"]) - 1
+            col = int(args["character"]) - 1
+        elif args.get("symbol"):  # by name — the tool finds the position
+            resolved = _resolve_symbol(
+                path.read_text(), args["symbol"], args.get("line")
+            )
+            if resolved is None:
+                return f"symbol '{args['symbol']}' not found in {path}", True
+            line, col = resolved
+        else:
+            return f"give `symbol` (or `line`+`character`) for `{op}`", True
+        if op == "hover":
+            return _fmt_hover(await client.hover(path, line, col)), False
+        if op == "definition":
+            return _fmt_locations(await client.definition(path, line, col)), False
+        return _fmt_locations(await client.references(path, line, col)), False
+
+    return Tool(
+        name=f"lsp_{server.language_id}",
+        description=(
+            f"Query the {server.language_id} language server "
+            f"(`{' '.join(server.cmd)}`). "
+            "operation ∈ {hover, definition, references, diagnostics}. "
+            "To locate a name, pass `symbol` and the tool finds its position — "
+            "e.g. `definition path=… symbol=download_file`, or add a `line` to "
+            "disambiguate a name used more than once. `line`+`character` "
+            "(1-based, matching `read`'s line numbers) is an optional precise "
+            "override; both are ignored for `diagnostics`. `wait` "
+            "(diagnostics only) is the max seconds to wait for the server to "
+            "publish — raise it on a large cold workspace still indexing."
+        ),
+        schema={
+            "type": "object",
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": ["hover", "definition", "references", "diagnostics"],
+                },
+                "path": {"type": "string"},
+                "symbol": {"type": "string"},
+                "line": {"type": "integer", "minimum": 1},
+                "character": {"type": "integer", "minimum": 1},
+                "wait": {"type": "number", "minimum": 0},
+            },
+            "required": ["operation", "path"],
+        },
+        execute=execute,
+    )
+
+
+def _install_lsp(api: HookAPI, server: LspServer) -> None:
+    """One client, one tool, one teardown — shared body for per-language hooks.
+
+    No-op when `server.cmd[0]` isn't on PATH, so a missing language server
+    doesn't pollute the tool surface with something that can only fail.
+    """
+    if shutil.which(server.cmd[0]) is None:
+        return
+    client = LspClient(server, Path.cwd())
+    api.register_tool(_lsp_tool(server, client))
+
+    @api.on("session_end")
+    async def cleanup(_p: Any, _ctx: dict) -> None:
+        await client.shutdown()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -556,25 +1023,25 @@ async def agent_loop(
     session: SessionManager,
     runner: HookRunner,
     pending_reminders: list[str],
-    max_turns: int = 25,
+    max_turns: int = 50,
 ) -> None:
     tool_map = {t.name: t for t in tools}
     schemas = [t.to_anthropic() for t in tools]
     ctx = {"cwd": cwd, "session": session}
 
     for _ in range(max_turns):
-        runner.fire("turn_start", None, ctx)
+        await runner.fire("turn_start", None, ctx)
 
-        sp = runner.fire("build_system_prompt", SystemPrompt(cwd=cwd), ctx)
+        sp = await runner.fire("build_system_prompt", SystemPrompt(cwd=cwd), ctx)
         assert isinstance(sp, SystemPrompt)
         system: Any = sp.system_prompt
         for extra in sp.additional_context:
             system += f"\n\n{extra}"
 
         mr = ModelRequest(system=system, tools=schemas, messages=session.to_messages())
-        runner.fire("before_model_request", mr, ctx)
+        await runner.fire("before_model_request", mr, ctx)
         max_tokens = mr.extra.pop("max_tokens", 64000)
-        runner.fire("model_request_prepared", mr, ctx)
+        await runner.fire("model_request_prepared", mr, ctx)
 
         async with client.messages.stream(
             model=model,
@@ -586,16 +1053,30 @@ async def agent_loop(
         ) as stream:
             had_text = False
             async for text in stream.text_stream:
-                runner.fire("text_delta", TextDelta(text=text), ctx)
+                await runner.fire("text_delta", TextDelta(text=text), ctx)
                 had_text = True
             if had_text:
-                runner.fire("text_end", None, ctx)
-            res = await stream.get_final_message()
+                await runner.fire("text_end", None, ctx)
+            try:
+                res = await stream.get_final_message()
+            except AssertionError:
+                # No events accumulated: the endpoint returned something that
+                # wasn't a valid SSE stream (e.g. an error body served with
+                # HTTP 200). Surface what we know instead of a bare
+                # AssertionError from deep inside the SDK.
+                resp = stream.response
+                raise RuntimeError(
+                    "model stream produced no events "
+                    f"(HTTP {resp.status_code}, content-type "
+                    f"{resp.headers.get('content-type')!r}); the endpoint did "
+                    "not return a valid SSE stream — check the model, params, "
+                    "or proxy"
+                ) from None
 
         dumped = res.model_dump(mode="json")
         assistant_content = dumped["content"]
         session.append("assistant", assistant_content)
-        runner.fire(
+        await runner.fire(
             "message_end",
             MessageEnd(message=assistant_content, usage=res.usage.model_dump()),
             ctx,
@@ -603,24 +1084,38 @@ async def agent_loop(
 
         tool_uses = [b for b in res.content if b.type == "tool_use"]
         if not tool_uses:
-            runner.fire("stop", None, ctx)
+            await runner.fire("stop", None, ctx)
             return
 
         tool_results = []
+
+        # Phase 1 — pre_tool_use, sequential and ordered: these hooks may mutate
+        # shared state (reminders, blocking), so they must not run concurrently.
+        prepared: list[tuple[Any, PreTool]] = []
         for tu in tool_uses:
             pre = PreTool(id=tu.id, name=tu.name, input=tu.input, state={})
-            runner.fire("pre_tool_use", pre, ctx)
+            await runner.fire("pre_tool_use", pre, ctx)
             pending_reminders.extend(pre.additional_context)
+            prepared.append((tu, pre))
 
+        # Phase 2 — execute, concurrent: only the I/O-bound `execute` bodies
+        # overlap, so a turn's independent tool calls (lsp, bash, cargo) run in
+        # parallel. Caveat: concurrent edit/write to the *same* path is unguarded
+        # — the model would have to emit conflicting parallel writes (rare);
+        # pi-mono's file-mutation-queue is the reference if it ever bites.
+        async def run(pre: PreTool) -> tuple[str, bool]:
             if pre.blocked:
-                content, is_error = pre.reason or "blocked by hook", True
-            else:
-                tool = tool_map.get(tu.name)
-                if tool is None:
-                    content, is_error = f"unknown tool: {tu.name}", True
-                else:
-                    content, is_error = tool.execute(pre.input)
+                return pre.reason or "blocked by hook", True
+            tool = tool_map.get(pre.name)
+            if tool is None:
+                return f"unknown tool: {pre.name}", True
+            return await _maybe_await(tool.execute(pre.input))
 
+        outcomes = await asyncio.gather(*(run(pre) for _tu, pre in prepared))
+
+        # Phase 3 — post_tool_use, sequential and ordered: results are appended in
+        # the model's original tool_use order so ids line up turn to turn.
+        for (tu, pre), (content, is_error) in zip(prepared, outcomes):
             post = PostTool(
                 id=tu.id,
                 name=tu.name,
@@ -629,7 +1124,7 @@ async def agent_loop(
                 is_error=is_error,
                 state=pre.state,
             )
-            runner.fire("post_tool_use", post, ctx)
+            await runner.fire("post_tool_use", post, ctx)
             pending_reminders.extend(post.additional_context)
 
             tool_results.append(
@@ -655,23 +1150,25 @@ class AgentSession:
     session: SessionManager
     runner: HookRunner = field(default_factory=HookRunner)
     pending_reminders: list[str] = field(default_factory=list)
-    max_turns: int = 25
+    max_turns: int = 50
 
     def _ctx(self) -> dict:
         return {"cwd": os.getcwd(), "session": self.session}
 
-    def start(self) -> None:
-        p = self.runner.fire(
+    async def start(self) -> None:
+        p = await self.runner.fire(
             "session_start", SessionStart(cwd=os.getcwd()), self._ctx()
         )
         assert isinstance(p, SessionStart)
         self.pending_reminders.extend(p.additional_context)
 
-    def end(self) -> None:
-        self.runner.fire("session_end", None, self._ctx())
+    async def end(self) -> None:
+        await self.runner.fire("session_end", None, self._ctx())
 
     async def prompt(self, text: str) -> None:
-        p = self.runner.fire("user_prompt_submit", UserPrompt(prompt=text), self._ctx())
+        p = await self.runner.fire(
+            "user_prompt_submit", UserPrompt(prompt=text), self._ctx()
+        )
         assert isinstance(p, UserPrompt)
         self.pending_reminders.extend(p.additional_context)
         if p.blocked:
@@ -744,18 +1241,51 @@ def bash_tool_hook(api: HookAPI) -> None:
     api.register_tool(_bash_tool())
 
 
+def _paths_touched(name: str, args: dict, ext: str) -> list[Path]:
+    """Return paths ending in ``.{ext}`` that this tool may have written.
+
+    Knows ``edit``/``write`` (path arg) and ``bash`` (``>`` / ``>>`` redirect
+    targets, including heredocs). Generic over extension so the language hooks
+    in sibling extension files (rust.py, python.py) can reuse it.
+    """
+    if name in ("edit", "write"):
+        path = args.get("path", "")
+        if isinstance(path, str) and path.endswith(f".{ext}"):
+            return [Path(path)]
+        return []
+    if name == "bash":
+        cmd = args.get("cmd", "")
+        if not isinstance(cmd, str):
+            return []
+        pattern = rf">>?\s*([^\s\'\"`;|&]+\.{re.escape(ext)})\b"
+        return [Path(m) for m in re.findall(pattern, cmd)]
+    return []
+
+
 def system_prompt_hook(api: HookAPI) -> None:
     today = date.today().isoformat()
 
     @api.on("build_system_prompt")
     def build(p: SystemPrompt, _ctx: dict) -> None:
-        p.system_prompt = f"""You are a Python coding assistant. You have four tools: read, write, edit, bash.
+        has_lsp = any(t.name == "lsp_python" for t in api.runner.tools)
+        lsp_tool = (
+            " and lsp_python (semantic queries by symbol name: hover/definition/references, plus diagnostics)"
+            if has_lsp
+            else ""
+        )
+        lsp_rule = (
+            "\n- To understand unfamiliar code, use `lsp_python` `definition`/`hover`/`references` by `symbol` (e.g. `references symbol=foo`) rather than guessing from a single `read`."
+            "\n- After editing a `.py` file, run `lsp_python` `diagnostics` on it to catch errors before claiming done."
+            if has_lsp
+            else ""
+        )
+        p.system_prompt = f"""You are a Python coding assistant. Tools: read, write, edit, bash{lsp_tool}.
 
 Rules:
 - Always `read` a file before you `write` or `edit` it.
 - Prefer `edit` for small changes. Only `write` for new files or full rewrites.
 - If a tool errors, read the error and try again.
-- Verify results with tools before claiming done (re-read the file after editing, run the test, check the exit code).
+- Verify results with tools before claiming done (re-read the file after editing, run the test, check the exit code).{lsp_rule}
 - Keep replies short. Explain what you did, not what you're about to do.
 
 Current date: {today}
@@ -862,8 +1392,13 @@ def debug_hooks_flag_hook(api: HookAPI) -> None:
             print(ctx["runner"].describe(), file=sys.stderr)
 
 
+# The default model: applied by `model_flag_hook` when present, and fallen
+# back to in `run()` when that hook has been removed (hooks are optional).
+DEFAULT_MODEL = "us.anthropic.claude-opus-4-8"
+
+
 def model_flag_hook(api: HookAPI) -> None:
-    api.register_flag("--model", default="claude-sonnet-4-6")
+    api.register_flag("--model", default=DEFAULT_MODEL)
 
     @api.on("build_session_config")
     def provide(p: SessionConfig, _ctx: dict) -> None:
@@ -871,7 +1406,7 @@ def model_flag_hook(api: HookAPI) -> None:
 
 
 def max_turns_flag_hook(api: HookAPI) -> None:
-    api.register_flag("--max-turns", type=int, default=25)
+    api.register_flag("--max-turns", type=int, default=50)
 
     @api.on("build_session_config")
     def provide(p: SessionConfig, _ctx: dict) -> None:
@@ -928,12 +1463,19 @@ def thinking_hook(api: HookAPI) -> None:
 
 
 def output_effort_hook(api: HookAPI) -> None:
-    """--effort LEVEL — sets output_config.effort (default 'xhigh')."""
+    """--effort LEVEL — sets output_config.effort (default 'xhigh').
+
+    These are the effort levels the default model
+    (us.anthropic.claude-opus-4-8) accepts. 'xhigh' is model-dependent:
+    claude-sonnet-4-6, for one, only takes low/medium/high/max and 400s on
+    'xhigh' — which some endpoints surface as a zero-event stream (a bare
+    AssertionError out of the SDK) rather than a clean error.
+    """
     _stream_extra_hook(
         api,
         lambda a: {"output_config": {"effort": a.effort}},
         "--effort",
-        choices=("low", "medium", "high", "xhigh"),
+        choices=("low", "medium", "high", "xhigh", "max"),
         default="xhigh",
     )
 
@@ -1284,6 +1826,8 @@ def ui_hook(api: HookAPI) -> None:
         console.print(f"[dim](session saved to {ctx['session'].path})[/dim]")
 
 
+# Built-in hooks, loaded first. Language support lives in sibling extension
+# files (rust.py, python.py, …) discovered by load_extensions() — not here.
 HOOKS = (
     prompt_arg_hook,
     model_flag_hook,
@@ -1312,22 +1856,55 @@ HOOKS = (
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Entrypoint
+# Extensions + entrypoint
 # ═══════════════════════════════════════════════════════════════════════════
+
+
+def load_extensions(runner: HookRunner, directory: Path | None = None) -> None:
+    """Discover and load sibling extension files.
+
+    An *extension* is any `.py` beside this one that exposes a module-level
+    `HOOKS` tuple of `(HookAPI) -> None` callables — the same shape agent.py
+    uses for its own built-ins. Drop a file in the directory and it loads on
+    the next run; there is no registry to edit. Extensions import the toolkit
+    they need (`Tool`, `LspServer`, `_install_lsp`, `_paths_touched`, …) from
+    `agent`. The agent file itself and `test_*`/`conftest`/`_*` files are
+    skipped; a broken extension is logged and skipped, never fatal.
+    """
+    directory = directory or Path(__file__).resolve().parent
+    for path in sorted(directory.glob("*.py")):
+        if path.resolve() == Path(__file__).resolve():
+            continue
+        if path.stem.startswith(("_", "test_")) or path.stem == "conftest":
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location(path.stem, path)
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[path.stem] = module
+            spec.loader.exec_module(module)
+        except Exception:
+            print(f"[extension {path.name} failed to import]", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+            continue
+        for hook in getattr(module, "HOOKS", ()):
+            runner.load(hook)
 
 
 async def main() -> None:
     runner = HookRunner()
     for hook in HOOKS:
         runner.load(hook)
+    load_extensions(runner)
 
     args = runner.parse_args()
     ctx = {"args": args, "runner": runner}
-    runner.fire("args_parsed", ArgsParsed(args=args), ctx)
+    await runner.fire("args_parsed", ArgsParsed(args=args), ctx)
 
-    cfg = runner.fire("build_session_config", SessionConfig(args=args), ctx)
+    cfg = await runner.fire("build_session_config", SessionConfig(args=args), ctx)
     assert isinstance(cfg, SessionConfig)
-    sp = runner.fire("before_session_load", SessionPath(args=args), ctx)
+    sp = await runner.fire("before_session_load", SessionPath(args=args), ctx)
     assert isinstance(sp, SessionPath) and sp.path is not None
 
     prompt = await runner.prompter(args)
@@ -1337,17 +1914,17 @@ async def main() -> None:
     session = SessionManager(sp.path)
     agent = AgentSession(
         client=cfg.client,
-        model=cfg.model or "claude-sonnet-4-6",
+        model=cfg.model or DEFAULT_MODEL,
         max_turns=cfg.max_turns,
         session=session,
         runner=runner,
     )
 
-    agent.start()
+    await agent.start()
     try:
         await agent.prompt(prompt)
     finally:
-        agent.end()
+        await agent.end()
 
 
 if __name__ == "__main__":
